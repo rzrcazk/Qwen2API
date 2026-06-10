@@ -5935,18 +5935,30 @@ func mediaDimensions(size string) (int, int) {
 func resolveMediaModel(requested string, image bool) string {
 	requested = strings.TrimSpace(requested)
 	if requested == "" {
-		return "qwen3.6-plus"
+		return "qwen3.7-plus"
 	}
 	aliases := map[string]string{
-		"dall-e-3": "qwen3.6-plus", "dall-e-2": "qwen3.6-plus", "gpt-image-1": "qwen3.6-plus",
-		"qwen-image": "qwen3.6-plus", "qwen-image-plus": "qwen3.6-plus", "qwen-image-turbo": "qwen3.6-plus",
-		"qwen-video": "qwen3.6-plus", "qwen-video-plus": "qwen3.6-plus", "qwen-video-turbo": "qwen3.6-plus",
-		"sora": "qwen3.6-plus", "sora-2": "qwen3.6-plus",
+		// OpenAI / Sora family → qwen3.7-plus
+		"dall-e-3": "qwen3.7-plus", "dall-e-2": "qwen3.7-plus", "gpt-image-1": "qwen3.7-plus",
+		"gpt-image-1-mini": "qwen3.7-plus",
+		"qwen-image": "qwen3.7-plus", "qwen-image-plus": "qwen3.7-plus", "qwen-image-turbo": "qwen3.7-plus",
+		"qwen-image-edit-plus": "qwen3.7-plus",
+		"qwen-video": "qwen3.7-plus", "qwen-video-plus": "qwen3.7-plus", "qwen-video-turbo": "qwen3.7-plus",
+		"sora": "qwen3.7-plus", "sora-2": "qwen3.7-plus",
+		// qwen3.7-plus family variants → qwen3.7-plus base
+		"qwen3.7-plus": "qwen3.7-plus",
+		"qwen3.7-plus-image": "qwen3.7-plus", "qwen3.7-plus-t2i": "qwen3.7-plus",
+		"qwen3.7-plus-video": "qwen3.7-plus", "qwen3.7-plus-t2v": "qwen3.7-plus",
+		"qwen3.7-plus-thinking": "qwen3.7-plus",
+		"qwen3.7-plus-search": "qwen3.7-plus",
+		"qwen3.7-plus-deep-research": "qwen3.7-plus", "qwen3.7-plus-deep_research": "qwen3.7-plus",
+		"qwen3.7-plus-webdev": "qwen3.7-plus", "qwen3.7-plus-web-dev": "qwen3.7-plus",
+		"qwen3.7-plus-slides": "qwen3.7-plus",
 	}
 	if v, ok := aliases[strings.ToLower(requested)]; ok {
 		return v
 	}
-	mode := parseModelMode(requested, "qwen3.6-plus")
+	mode := parseModelMode(requested, "qwen3.7-plus")
 	return resolveModel(mode.BaseModel)
 }
 
