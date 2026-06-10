@@ -8,6 +8,7 @@ import (
 	"context"
 	cryptorand "crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -5660,7 +5661,8 @@ func (app *App) handleDeleteFile(w http.ResponseWriter, r *http.Request) {
 }
 
 func (app *App) handleImages(w http.ResponseWriter, r *http.Request) {
-	if _, ok := app.resolveAuth(w, r); !ok {
+	auth, ok := app.resolveAuth(w, r)
+	if !ok {
 		return
 	}
 	var body map[string]any
@@ -5682,7 +5684,18 @@ func (app *App) handleImages(w http.ResponseWriter, r *http.Request) {
 	promptText := "请调用图片生成能力直接生成图片，不要只输出文字描述。如果可以生成图片，请返回可访问的图片链接或包含图片链接的结果。\n" +
 		"强制画布尺寸：" + size + " 像素。强制宽高比：" + ratio + "。必须严格按这个尺寸和比例生成，不要裁切成其它比例，不要改成默认尺寸。\n\n用户需求：" + prompt
 
-	urls, lastErr := app.createImageURLs(r.Context(), model, promptText, map[string]any{"size": size, "ratio": ratio, "width": width, "height": height})
+	// Optional i2i: accept an input image via the `image` field. Acceptable
+	// forms: data URL ("data:image/...;base64,..."), http(s):// URL, or a
+	// file_id returned by /v1/files. When set, the input image is attached
+	// to the upstream chat as a multimodal file so the model can reference
+	// (i2i / image edit) it. The prompt-injection block above is unchanged.
+	inputFiles, inputErr := app.resolveMediaInputImage(r.Context(), stringValue(body, "image", ""), auth)
+	if inputErr != nil {
+		writeError(w, http.StatusBadRequest, inputErr.Error())
+		return
+	}
+
+	urls, lastErr := app.createImageURLs(r.Context(), model, promptText, map[string]any{"size": size, "ratio": ratio, "width": width, "height": height}, inputFiles)
 	if lastErr != nil {
 		app.logWarn(r.Context(), "图片生成失败", "error", lastErr)
 		writeError(w, upstreamMediaErrorStatus(lastErr), lastErr.Error())
@@ -5704,7 +5717,84 @@ func (app *App) handleImages(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"created": time.Now().Unix(), "data": data})
 }
 
-func (app *App) createImageURLs(ctx context.Context, model, promptText string, imageOptions map[string]any) ([]string, error) {
+// resolveMediaInputImage turns the OpenAI-style `image` field on a media
+// request into a single upstream file block. It accepts:
+//   - a data URL  ("data:<mime>;base64,<payload>")
+//   - an http(s) URL the upstream can fetch directly
+//   - a file_id  ("file-...") referring to a previously uploaded file owned
+//     by the same auth token (resolved through the Files API store)
+//
+// Returns nil, nil when the field is empty (pure t2i / t2v call). Any other
+// shape is rejected with a 400-friendly error so the caller can surface it
+// verbatim. The file block matches the shape the upstream
+// `BuildChatPayload` already accepts ({"type":"image_url","image_url":{"url":...}})
+// so the existing pipeline does not need further changes.
+func (app *App) resolveMediaInputImage(ctx context.Context, imageField string, auth *AuthContext) ([]map[string]any, error) {
+	field := strings.TrimSpace(imageField)
+	if field == "" {
+		return nil, nil
+	}
+	// 1) data URL — pass through unchanged.
+	if strings.HasPrefix(strings.ToLower(field), "data:") {
+		return []map[string]any{{
+			"type":      "image_url",
+			"image_url": map[string]any{"url": field},
+		}}, nil
+	}
+	// 2) http(s) URL — pass through.
+	lower := strings.ToLower(field)
+	if strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://") {
+		return []map[string]any{{
+			"type":      "image_url",
+			"image_url": map[string]any{"url": field},
+		}}, nil
+	}
+	// 3) file_id — look up in the uploaded file store owned by auth.Token.
+	if strings.HasPrefix(field, "file-") {
+		ownerToken := ""
+		if auth != nil {
+			ownerToken = auth.Token
+		}
+		record, err := app.getUploadedLocalFile(field, ownerToken)
+		if err != nil {
+			return nil, fmt.Errorf("image file_id lookup failed: %w", err)
+		}
+		if record == nil {
+			return nil, fmt.Errorf("image file_id not found: %s", field)
+		}
+		// Defence in depth: refuse to read a record whose on-disk path is
+		// outside the configured ContextGeneratedDir, even if the record
+		// claims to be owned by this token.
+		allowed := normalizeWorkspacePath(app.settings.ContextGeneratedDir)
+		target := normalizeWorkspacePath(record.Path)
+		if allowed == "" || target == "" {
+			return nil, fmt.Errorf("image file_id is not accessible")
+		}
+		if !strings.EqualFold(target, allowed) &&
+			!strings.HasPrefix(strings.ToLower(target), strings.ToLower(allowed)+string(filepath.Separator)) {
+			return nil, fmt.Errorf("image file_id is not accessible")
+		}
+		raw, err := os.ReadFile(record.Path)
+		if err != nil {
+			return nil, fmt.Errorf("read image file_id content failed: %w", err)
+		}
+		mimeType := strings.TrimSpace(record.ContentType)
+		if mimeType == "" {
+			mimeType = mime.TypeByExtension(filepath.Ext(record.Filename))
+		}
+		if mimeType == "" {
+			mimeType = "application/octet-stream"
+		}
+		dataURL := fmt.Sprintf("data:%s;base64,%s", mimeType, base64.StdEncoding.EncodeToString(raw))
+		return []map[string]any{{
+			"type":      "image_url",
+			"image_url": map[string]any{"url": dataURL},
+		}}, nil
+	}
+	return nil, fmt.Errorf("image must be a data URL, http(s) URL, or file_id (got %q)", truncate(field, 80))
+}
+
+func (app *App) createImageURLs(ctx context.Context, model, promptText string, imageOptions map[string]any, files []map[string]any) ([]string, error) {
 	var lastErr error
 	attempts := app.mediaRetryAttempts()
 	for attempt := 0; attempt < attempts; attempt++ {
@@ -5728,7 +5818,7 @@ func (app *App) createImageURLs(ctx context.Context, model, promptText string, i
 			defer asyncDeleteChat(app.client, acc.Token, chatID)
 			setRequestLogFields(ctx, "chat_id", chatID)
 
-			payload := buildChatPayload(chatID, model, promptText, false, nil, "image_gen", imageOptions, nil, false)
+			payload := buildChatPayload(chatID, model, promptText, false, files, "image_gen", imageOptions, nil, false)
 			parts := []string{}
 			if err := app.client.StreamChat(ctx, acc.Token, chatID, payload, func(evt UpstreamEvent) error {
 				if evt.Content != "" {
