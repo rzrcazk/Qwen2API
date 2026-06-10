@@ -191,6 +191,123 @@ flowchart LR
 | `HOST_DATA_DIR`、`HOST_LOGS_DIR` | Docker 宿主机挂载路径，默认 `./data` 和 `./logs` |
 | `DATA_DIR`、`LOGS_DIR` | 本地非 Docker 路径覆盖；留空时使用当前项目目录 |
 
+### 3. 媒体生成接口（t2i / i2i / t2v / i2v）
+
+两个媒体接口都支持一个可选的 OpenAI 风格 `image` 字段，因此可以走纯文生（`t2i` / `t2v`）或图生（`i2i` / `i2v`）两条路径，不需要换接口。`image` 字段接受三种等价形式：
+
+- `data:` URL（`data:image/png;base64,...`）—— 把参考图直接嵌进请求体
+- 上游能直接抓取的公网 `http(s)://` 链接
+- `POST /v1/files`（multipart 上传）返回的 `file_id`（文件必须归调用方当前的 `QWEN_API_KEY` 所有）
+
+默认模型是 `qwen3.7-plus`。旧别名（`dall-e-3`、`gpt-image-1`、`sora`、`qwen-image-plus`、`qwen-video-plus` 等）依然兼容，最终都会路由到同一个上游。
+
+下面三个示例假设网关跑在 `http://127.0.0.1:7860`，并已经导出下游 Key：
+
+```bash
+export QWEN_API_KEY=sk-your-downstream-key
+```
+
+#### a. 纯文生图（t2i，向后兼容）
+
+```bash
+curl -sS http://127.0.0.1:7860/v1/images/generations \
+  -H "Authorization: Bearer $QWEN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "一只坐在竹林里晒太阳的小熊猫",
+    "n": 1,
+    "size": "1024x1024",
+    "model": "qwen-image-plus"
+  }'
+```
+
+成功响应（`200 OK`）：
+
+```json
+{
+  "created": 1718000000,
+  "data": [
+    {
+      "url": "https://cdn.qwenlm.ai/.../image.png",
+      "revised_prompt": "一只坐在竹林里晒太阳的小熊猫",
+      "size": "1024x1024",
+      "ratio": "1:1",
+      "width": 1024,
+      "height": 1024
+    }
+  ]
+}
+```
+
+#### b. 图生图（i2i，data URL）
+
+参考图直接嵌在请求体里。适合单次改图、文件较小（几百 KiB 以内）的场景。
+
+```bash
+curl -sS http://127.0.0.1:7860/v1/images/generations \
+  -H "Authorization: Bearer $QWEN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "给小熊猫戴上一顶草帽",
+    "image": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAA...",
+    "size": "1024x1024",
+    "model": "qwen-image-plus"
+  }'
+```
+
+响应结构和 t2i 完全一致。上游会把它当作多模态参考，chat 类型从 `image_gen` 自动切到 i2i 变体。
+
+#### c. 图生视频（i2v，通过 `file_id`）
+
+`/v1/videos/generations` 走相同的逻辑。如果参考图比较大（或者同一张图要在多个请求里复用），先上传一次拿 `file_id`：
+
+**第一步——上传参考图**（multipart，单文件最大 128 MiB）：
+
+```bash
+FILE_ID=$(curl -sS http://127.0.0.1:7860/v1/files \
+  -H "Authorization: Bearer $QWEN_API_KEY" \
+  -F "file=@./reference.png;type=image/png" \
+  | jq -r .id)
+
+echo "Uploaded: $FILE_ID"
+```
+
+**第二步——请求 i2v 生成**：
+
+```bash
+curl -sS http://127.0.0.1:7860/v1/videos/generations \
+  -H "Authorization: Bearer $QWEN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"prompt\": \"小熊猫挥挥手打招呼，镜头缓慢平移\",
+    \"image\": \"$FILE_ID\",
+    \"size\": \"1280x720\",
+    \"duration\": 5,
+    \"model\": \"qwen-video-plus\"
+  }"
+```
+
+成功响应（`200 OK`）：
+
+```json
+{
+  "created": 1718000000,
+  "data": [
+    {
+      "url": "https://cdn.qwenlm.ai/.../video.mp4",
+      "revised_prompt": "小熊猫挥挥手打招呼，镜头缓慢平移",
+      "size": "1280x720",
+      "ratio": "16:9",
+      "width": 1280,
+      "height": 720,
+      "duration": 5
+    }
+  ]
+}
+```
+
+如果只是纯 `t2v` 调用，不传 `image` 字段即可——chat 类型保持 `t2v`，行为和老版本完全一致。
+
 ## 四、开发指南
 
 ### 1. 环境要求
