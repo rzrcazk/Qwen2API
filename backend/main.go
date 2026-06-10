@@ -5884,7 +5884,8 @@ func (app *App) createImageURLs(ctx context.Context, model, promptText string, i
 }
 
 func (app *App) handleVideos(w http.ResponseWriter, r *http.Request) {
-	if _, ok := app.resolveAuth(w, r); !ok {
+	auth, ok := app.resolveAuth(w, r)
+	if !ok {
 		return
 	}
 	var body map[string]any
@@ -5905,7 +5906,24 @@ func (app *App) handleVideos(w http.ResponseWriter, r *http.Request) {
 	setRequestLogFields(r.Context(), "surface", "videos", "requested_model", stringValue(body, "model", ""), "resolved_model", model, "stream", "false", "tool_enabled", "false", "prompt_len", len(prompt))
 	app.logInfo(r.Context(), "视频生成请求解析完成", "size", size, "ratio", ratio, "width", width, "height", height, "duration", duration, "n", n)
 	promptText := fmt.Sprintf("%s\n\n视频要求：生成 %d 秒视频，宽高比 %s，参考画面尺寸 %s。", prompt, duration, ratio, size)
-	urls, lastErr := app.createVideoURLs(r.Context(), model, promptText, map[string]any{"size": size, "ratio": ratio, "width": width, "height": height, "duration": duration})
+
+	// Optional i2v: attach an input image for image-to-video style calls.
+	// Accepts the same three shapes (data URL, http(s) URL, file_id) as the
+	// i2i image path. When set, the file is attached to the upstream chat
+	// so the model can use it as the first frame / reference.
+	// When the input image is provided we signal i2v to the upstream; for
+	// a pure t2v call the chat type stays "t2v" so behaviour is unchanged.
+	inputFiles, inputErr := app.resolveMediaInputImage(r.Context(), stringValue(body, "image", ""), auth)
+	if inputErr != nil {
+		writeError(w, http.StatusBadRequest, inputErr.Error())
+		return
+	}
+	chatType := "t2v"
+	if len(inputFiles) > 0 {
+		chatType = "i2v"
+	}
+
+	urls, lastErr := app.createVideoURLs(r.Context(), model, promptText, map[string]any{"size": size, "ratio": ratio, "width": width, "height": height, "duration": duration}, inputFiles, chatType)
 	if lastErr != nil {
 		app.logWarn(r.Context(), "视频生成失败", "error", lastErr)
 		writeError(w, upstreamMediaErrorStatus(lastErr), lastErr.Error())
@@ -5927,7 +5945,7 @@ func (app *App) handleVideos(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"created": time.Now().Unix(), "data": data})
 }
 
-func (app *App) createVideoURLs(ctx context.Context, model, promptText string, videoOptions map[string]any) ([]string, error) {
+func (app *App) createVideoURLs(ctx context.Context, model, promptText string, videoOptions map[string]any, files []map[string]any, chatType string) ([]string, error) {
 	var lastErr error
 	attempts := app.mediaRetryAttempts()
 	for attempt := 0; attempt < attempts; attempt++ {
@@ -5941,7 +5959,7 @@ func (app *App) createVideoURLs(ctx context.Context, model, promptText string, v
 			defer app.accounts.Release(acc)
 			setRequestLogFields(ctx, "account", acc.Email)
 			app.logInfo(ctx, "视频生成开始尝试", "attempt", attempt+1, "model", model)
-			chatID, err = app.client.CreateChat(ctx, acc.Token, model, "t2v")
+			chatID, err = app.client.CreateChat(ctx, acc.Token, model, chatType)
 			if err != nil {
 				app.classifyAccountErrorFor(acc, err, accountUsageVideo)
 				lastErr = err
@@ -5951,7 +5969,7 @@ func (app *App) createVideoURLs(ctx context.Context, model, promptText string, v
 			defer asyncDeleteChat(app.client, acc.Token, chatID)
 			setRequestLogFields(ctx, "chat_id", chatID)
 
-			payload := buildChatPayload(chatID, model, promptText, false, nil, "t2v", videoOptions, nil, false)
+			payload := buildChatPayload(chatID, model, promptText, false, files, chatType, videoOptions, nil, false)
 			payload["stream"] = false
 			status, body, err := app.client.PostChatCompletionOnce(ctx, acc.Token, chatID, payload, 90*time.Second)
 			if err != nil {
