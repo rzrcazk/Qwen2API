@@ -2403,6 +2403,8 @@ func (app *App) routes() http.Handler {
 	mux.HandleFunc("POST /videos/generations", app.handleVideos)
 	mux.HandleFunc("POST /v1/files", app.handleUploadFile)
 	mux.HandleFunc("POST /api/files/upload", app.handleUploadFile)
+	mux.HandleFunc("GET /v1/files/{file_id}", app.handleGetFile)
+	mux.HandleFunc("GET /api/files/{file_id}", app.handleGetFile)
 	mux.HandleFunc("DELETE /v1/files/{file_id}", app.handleDeleteFile)
 	mux.HandleFunc("DELETE /api/files/{file_id}", app.handleDeleteFile)
 
@@ -5545,6 +5547,81 @@ func (app *App) handleUploadFile(w http.ResponseWriter, r *http.Request) {
 		"content_type": record.ContentType, "created_at": record.CreatedAt,
 		"content_block": map[string]any{"type": "input_file", "file_id": record.ID, "filename": record.Filename, "mime_type": record.ContentType},
 	})
+}
+
+func (app *App) handleGetFile(w http.ResponseWriter, r *http.Request) {
+	auth, ok := app.resolveAuth(w, r)
+	if !ok {
+		return
+	}
+	fileID := strings.TrimSpace(r.PathValue("file_id"))
+	if fileID == "" {
+		writeError(w, http.StatusBadRequest, "file_id is required")
+		return
+	}
+	records, err := app.loadUploadedLocalFiles()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	var found *UploadedLocalFileRecord
+	for i := range records {
+		if records[i].ID == fileID {
+			found = &records[i]
+			break
+		}
+	}
+	if found == nil {
+		writeError(w, http.StatusNotFound, "File not found")
+		return
+	}
+	if found.OwnerToken != "" && found.OwnerToken != auth.Token {
+		writeError(w, http.StatusForbidden, "Forbidden")
+		return
+	}
+	if strings.TrimSpace(found.Path) == "" {
+		writeError(w, http.StatusGone, "File content is no longer available")
+		return
+	}
+	// Path safety: record.Path must live inside app.settings.ContextGeneratedDir.
+	// Reject any record whose path escapes the directory (defence in depth — the
+	// save side already constrains paths, but a tampered store must not let an
+	// attacker read arbitrary files).
+	allowed := normalizeWorkspacePath(app.settings.ContextGeneratedDir)
+	target := normalizeWorkspacePath(found.Path)
+	if allowed == "" || target == "" {
+		writeError(w, http.StatusForbidden, "Forbidden")
+		return
+	}
+	if !strings.EqualFold(target, allowed) &&
+		!strings.HasPrefix(strings.ToLower(target), strings.ToLower(allowed)+string(filepath.Separator)) {
+		writeError(w, http.StatusForbidden, "Forbidden")
+		return
+	}
+	raw, err := os.ReadFile(found.Path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			writeError(w, http.StatusNotFound, "File content is no longer available")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	contentType := strings.TrimSpace(found.ContentType)
+	if contentType == "" {
+		contentType = mime.TypeByExtension(filepath.Ext(found.Filename))
+	}
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Content-Length", strconv.Itoa(len(raw)))
+	w.Header().Set("X-File-Id", found.ID)
+	if filename := strings.TrimSpace(found.Filename); filename != "" {
+		w.Header().Set("Content-Disposition", fmt.Sprintf("inline; filename=%q", filename))
+	}
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(raw)
 }
 
 func (app *App) handleDeleteFile(w http.ResponseWriter, r *http.Request) {
