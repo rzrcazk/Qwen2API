@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -35,6 +36,7 @@ func newMediaTestApp(t *testing.T) *App {
 	accountsStore := NewJSONStore(filepath.Join(dir, "accounts.json"), []Account{})
 	settings := Settings{
 		ContextGeneratedDir:      dir,
+		ContextAllowedUserExts:   "txt,md,png,jpg,jpeg,webp,gif,bmp",
 		MaxRetries:               1,
 		MaxInflightPerAccount:    1,
 		AccountReadySetThreshold: 1,
@@ -778,4 +780,526 @@ func TestCreateVideoURLsReachesAcquireFor(t *testing.T) {
 	); err == nil {
 		t.Fatalf("createVideoURLs (t2v) unexpectedly succeeded")
 	}
+}
+
+// ---- multipart/form-data support for /v1/images and /v1/videos ----
+//
+// The tests below cover the new branch in handleImages/handleVideos that
+// accepts a multipart/form-data body (a single image part plus the
+// usual prompt / model / n / size form fields) so an OpenAI-style
+// caller can upload + generate in one round-trip. The pattern is the
+// same as the JSON-path tests above: the test App has an empty account
+// pool, so we pre-cancel the request context to make AcquireFor return
+// immediately; the assertions focus on the body-parse and multipart
+// validation paths, not the upstream call.
+
+// buildMultipartImagesRequest assembles a multipart/form-data body
+// for the /v1/images/generations route. `fields` is a free-form
+// key/value list (strings only) that becomes the non-file parts; if
+// `file` is non-nil it is written under the "image" form key with
+// `fileName` as the filename. The Content-Type returned is the
+// boundary-tagged value the request must carry.
+func buildMultipartImagesRequest(t *testing.T, fields map[string]string, file []byte, fileName, authHeader string) *http.Request {
+	t.Helper()
+	body := &bytes.Buffer{}
+	mw := multipart.NewWriter(body)
+	for k, v := range fields {
+		if err := mw.WriteField(k, v); err != nil {
+			t.Fatalf("write field %q: %v", k, err)
+		}
+	}
+	if file != nil {
+		fw, err := mw.CreateFormFile("image", fileName)
+		if err != nil {
+			t.Fatalf("create form file: %v", err)
+		}
+		if _, err := fw.Write(file); err != nil {
+			t.Fatalf("write file body: %v", err)
+		}
+	}
+	if err := mw.Close(); err != nil {
+		t.Fatalf("close multipart writer: %v", err)
+	}
+	req := httptest.NewRequest("POST", "/v1/images/generations", body)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	if authHeader != "" {
+		req.Header.Set("Authorization", authHeader)
+	}
+	return req
+}
+
+// buildMultipartVideosRequest is the videos-route mirror of
+// buildMultipartImagesRequest. The URL path is the only difference —
+// the multipart body assembly is identical.
+func buildMultipartVideosRequest(t *testing.T, fields map[string]string, file []byte, fileName, authHeader string) *http.Request {
+	t.Helper()
+	body := &bytes.Buffer{}
+	mw := multipart.NewWriter(body)
+	for k, v := range fields {
+		if err := mw.WriteField(k, v); err != nil {
+			t.Fatalf("write field %q: %v", k, err)
+		}
+	}
+	if file != nil {
+		fw, err := mw.CreateFormFile("image", fileName)
+		if err != nil {
+			t.Fatalf("create form file: %v", err)
+		}
+		if _, err := fw.Write(file); err != nil {
+			t.Fatalf("write file body: %v", err)
+		}
+	}
+	if err := mw.Close(); err != nil {
+		t.Fatalf("close multipart writer: %v", err)
+	}
+	req := httptest.NewRequest("POST", "/v1/videos/generations", body)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	if authHeader != "" {
+		req.Header.Set("Authorization", authHeader)
+	}
+	return req
+}
+
+// TestHandleImagesMultipartSuccess — a well-formed multipart request
+// with a prompt and a small PNG-like image part must clear the body
+// parse + save stage and proceed to the upstream call. We pre-cancel
+// the request context so the empty account pool returns immediately;
+// the test asserts the response is NOT a 400 (we got past validation)
+// and the saved file is now visible in the on-disk store.
+func TestHandleImagesMultipartSuccess(t *testing.T) {
+	app := newMediaTestApp(t)
+	// Minimal 1x1 PNG (base64-decoded from the standard test vector).
+	const tinyPNG = "\x89PNG\r\n\x1a\n" + "fake-but-valid-looking-bytes-for-test-only"
+	req := buildMultipartImagesRequest(t,
+		map[string]string{
+			"prompt": "a friendly red panda wearing a scarf",
+			"model":  "qwen-image-plus",
+			"n":      "1",
+			"size":   "1024x1024",
+		},
+		[]byte(tinyPNG), "ref.png", "Bearer test-token",
+	)
+	ctx, cancel := context.WithCancel(req.Context())
+	cancel()
+	req = req.WithContext(ctx)
+	rec := httptest.NewRecorder()
+
+	app.handleImages(rec, req)
+
+	if rec.Code == http.StatusBadRequest {
+		t.Fatalf("handleImages(multipart) returned 400: %s", rec.Body.String())
+	}
+	if rec.Code == http.StatusUnauthorized {
+		t.Fatalf("handleImages(multipart) returned 401: %s", rec.Body.String())
+	}
+
+	// The save side should have run before the upstream call failed —
+	// confirm at least one record landed in the store, owned by the
+	// auth token we sent.
+	records, err := app.loadUploadedLocalFiles()
+	if err != nil {
+		t.Fatalf("loadUploadedLocalFiles: %v", err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("expected 1 saved record, got %d", len(records))
+	}
+	if records[0].OwnerToken != "test-token" {
+		t.Fatalf("record owner = %q, want test-token", records[0].OwnerToken)
+	}
+	if records[0].Source != "media-multipart" {
+		t.Fatalf("record source = %q, want media-multipart", records[0].Source)
+	}
+	if !strings.HasPrefix(records[0].ID, "file-") {
+		t.Fatalf("record ID = %q, want file-*", records[0].ID)
+	}
+	if records[0].Filename != "ref.png" {
+		t.Fatalf("record filename = %q, want ref.png", records[0].Filename)
+	}
+}
+
+// TestHandleImagesMultipartMissingImage — a multipart request with
+// only prompt (no file part) must be accepted as a pure t2i call.
+// Same short-circuit pattern: cancel context to fail fast on the
+// account pool side, then assert the response is NOT a 400.
+func TestHandleImagesMultipartMissingImage(t *testing.T) {
+	app := newMediaTestApp(t)
+	req := buildMultipartImagesRequest(t,
+		map[string]string{
+			"prompt": "a friendly red panda",
+			"model":  "qwen-image-plus",
+		},
+		nil, "", "Bearer test-token",
+	)
+	ctx, cancel := context.WithCancel(req.Context())
+	cancel()
+	req = req.WithContext(ctx)
+	rec := httptest.NewRecorder()
+
+	app.handleImages(rec, req)
+
+	if rec.Code == http.StatusBadRequest {
+		t.Fatalf("handleImages(multipart, no image) returned 400: %s", rec.Body.String())
+	}
+	if rec.Code == http.StatusUnauthorized {
+		t.Fatalf("handleImages(multipart, no image) returned 401: %s", rec.Body.String())
+	}
+
+	// No file part means no record should be created.
+	records, err := app.loadUploadedLocalFiles()
+	if err != nil {
+		t.Fatalf("loadUploadedLocalFiles: %v", err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("expected 0 saved records (pure t2i), got %d", len(records))
+	}
+}
+
+// TestHandleImagesMultipartBadExtension — when the uploaded file has
+// a .exe extension (or any extension not in
+// app.settings.ContextAllowedUserExts), the helper must reject with
+// 400 and the "Unsupported file extension" message that handleUploadFile
+// already uses.
+func TestHandleImagesMultipartBadExtension(t *testing.T) {
+	app := newMediaTestApp(t)
+	req := buildMultipartImagesRequest(t,
+		map[string]string{
+			"prompt": "irrelevant — should not get this far",
+		},
+		[]byte("MZ\x90\x00\x03"), "evil.exe", "Bearer test-token",
+	)
+	rec := httptest.NewRecorder()
+
+	app.handleImages(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "Unsupported file extension: exe") {
+		t.Fatalf("error body should mention unsupported extension; got %s", rec.Body.String())
+	}
+	// Nothing should be saved to the store.
+	records, err := app.loadUploadedLocalFiles()
+	if err != nil {
+		t.Fatalf("loadUploadedLocalFiles: %v", err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("expected 0 saved records on rejected upload, got %d", len(records))
+	}
+}
+
+// TestHandleImagesMultipartOversized — a 130MB file must be rejected
+// with 400 and the "File exceeds 128MB limit" message. We use a
+// zero-initialised buffer to keep the test cheap (we do not care
+// about file content, only its size).
+func TestHandleImagesMultipartOversized(t *testing.T) {
+	app := newMediaTestApp(t)
+	// 130MB = 130 * 1024 * 1024 bytes; using a non-PNG extension keeps
+	// the test simple (we should fail on size before content type
+	// would matter). Use ".bin" which is not in the allowed set, but
+	// we register it locally so the size check is the only failure.
+	app.settings.ContextAllowedUserExts = "txt,md,png,jpg,jpeg,webp,gif,bmp,bin"
+	oversized := make([]byte, 130*1024*1024) // 130MB of zeros
+	req := buildMultipartImagesRequest(t,
+		map[string]string{"prompt": "irrelevant"},
+		oversized, "huge.bin", "Bearer test-token",
+	)
+	rec := httptest.NewRecorder()
+
+	app.handleImages(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body=%s)", rec.Code, truncate(rec.Body.String(), 200))
+	}
+	if !strings.Contains(rec.Body.String(), "File exceeds 128MB limit") {
+		t.Fatalf("error body should mention 128MB limit; got %s", truncate(rec.Body.String(), 200))
+	}
+	records, err := app.loadUploadedLocalFiles()
+	if err != nil {
+		t.Fatalf("loadUploadedLocalFiles: %v", err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("expected 0 saved records on oversized upload, got %d", len(records))
+	}
+}
+
+// TestHandleImagesJSONRegression — after wiring the multipart branch,
+// the JSON body path must still work exactly as it did before. We send
+// a plain JSON request and assert it gets past body parsing (no 400),
+// which exercises the unchanged code path and catches a regression
+// where the multipart branch accidentally shadows the JSON branch.
+func TestHandleImagesJSONRegression(t *testing.T) {
+	app := newMediaTestApp(t)
+	body, _ := json.Marshal(map[string]any{
+		"prompt": "a friendly red panda",
+		"model":  "qwen-image-plus",
+		"n":      1,
+		"size":   "1024x1024",
+	})
+	req := httptest.NewRequest("POST", "/v1/images/generations", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer test-token")
+	ctx, cancel := context.WithCancel(req.Context())
+	cancel()
+	req = req.WithContext(ctx)
+	rec := httptest.NewRecorder()
+
+	app.handleImages(rec, req)
+
+	if rec.Code == http.StatusBadRequest {
+		t.Fatalf("JSON regression: handleImages returned 400: %s", rec.Body.String())
+	}
+	if rec.Code == http.StatusUnauthorized {
+		t.Fatalf("JSON regression: handleImages returned 401: %s", rec.Body.String())
+	}
+	// JSON path must not have created a file record.
+	records, err := app.loadUploadedLocalFiles()
+	if err != nil {
+		t.Fatalf("loadUploadedLocalFiles: %v", err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("expected 0 saved records on JSON path, got %d", len(records))
+	}
+}
+
+// TestHandleVideosMultipartSuccess — mirror of the images happy-path
+// test for /v1/videos/generations. We verify the multipart branch
+// saves the file and that downstream rejects the upload with a
+// non-400 / non-401 code (i.e. it got past body parsing).
+func TestHandleVideosMultipartSuccess(t *testing.T) {
+	app := newMediaTestApp(t)
+	const tinyPNG = "\x89PNG\r\n\x1a\nfake-but-valid-looking-bytes-for-test-only"
+	req := buildMultipartVideosRequest(t,
+		map[string]string{
+			"prompt":   "the red panda waves hello",
+			"model":    "qwen-video-plus",
+			"duration": "5",
+			"size":     "1280x720",
+		},
+		[]byte(tinyPNG), "ref.png", "Bearer test-token",
+	)
+	ctx, cancel := context.WithCancel(req.Context())
+	cancel()
+	req = req.WithContext(ctx)
+	rec := httptest.NewRecorder()
+
+	app.handleVideos(rec, req)
+
+	if rec.Code == http.StatusBadRequest {
+		t.Fatalf("handleVideos(multipart) returned 400: %s", rec.Body.String())
+	}
+	if rec.Code == http.StatusUnauthorized {
+		t.Fatalf("handleVideos(multipart) returned 401: %s", rec.Body.String())
+	}
+	records, err := app.loadUploadedLocalFiles()
+	if err != nil {
+		t.Fatalf("loadUploadedLocalFiles: %v", err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("expected 1 saved record, got %d", len(records))
+	}
+	if records[0].OwnerToken != "test-token" {
+		t.Fatalf("record owner = %q, want test-token", records[0].OwnerToken)
+	}
+	if records[0].Source != "media-multipart" {
+		t.Fatalf("record source = %q, want media-multipart", records[0].Source)
+	}
+}
+
+// TestHandleVideosJSONRegression — mirror of the images JSON
+// regression test for /v1/videos/generations. Confirms the JSON
+// branch of the new branching handler is unchanged.
+func TestHandleVideosJSONRegression(t *testing.T) {
+	app := newMediaTestApp(t)
+	body, _ := json.Marshal(map[string]any{
+		"prompt":   "the red panda waves hello",
+		"model":    "qwen-video-plus",
+		"duration": 5,
+		"size":     "1280x720",
+	})
+	req := httptest.NewRequest("POST", "/v1/videos/generations", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer test-token")
+	ctx, cancel := context.WithCancel(req.Context())
+	cancel()
+	req = req.WithContext(ctx)
+	rec := httptest.NewRecorder()
+
+	app.handleVideos(rec, req)
+
+	if rec.Code == http.StatusBadRequest {
+		t.Fatalf("JSON regression: handleVideos returned 400: %s", rec.Body.String())
+	}
+	if rec.Code == http.StatusUnauthorized {
+		t.Fatalf("JSON regression: handleVideos returned 401: %s", rec.Body.String())
+	}
+}
+
+// TestResolveMultipartMediaImageHelper — direct unit test of the
+// helper that does not go through the handler. This pins down the
+// contract: file_id is non-empty on success, "file-" prefix matches
+// the rest of the file store, and the record is owned by auth.Token.
+func TestResolveMultipartMediaImageHelper(t *testing.T) {
+	app := newMediaTestApp(t)
+	body := &bytes.Buffer{}
+	mw := multipart.NewWriter(body)
+	if err := mw.WriteField("prompt", "anything"); err != nil {
+		t.Fatalf("write field: %v", err)
+	}
+	fw, err := mw.CreateFormFile("image", "ref.png")
+	if err != nil {
+		t.Fatalf("create form file: %v", err)
+	}
+	if _, err := fw.Write([]byte("fake-png-bytes")); err != nil {
+		t.Fatalf("write file body: %v", err)
+	}
+	if err := mw.Close(); err != nil {
+		t.Fatalf("close multipart writer: %v", err)
+	}
+	req := httptest.NewRequest("POST", "/v1/images/generations", body)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+
+	auth := &AuthContext{Token: "helper-test-token"}
+	fileID, err := app.resolveMultipartMediaImage(context.Background(), req, auth)
+	if err != nil {
+		t.Fatalf("resolveMultipartMediaImage: %v", err)
+	}
+	if !strings.HasPrefix(fileID, "file-") {
+		t.Fatalf("fileID = %q, want file- prefix", fileID)
+	}
+
+	records, err := app.loadUploadedLocalFiles()
+	if err != nil {
+		t.Fatalf("loadUploadedLocalFiles: %v", err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("expected 1 saved record, got %d", len(records))
+	}
+	if records[0].ID != fileID {
+		t.Fatalf("record.ID = %q, helper returned %q", records[0].ID, fileID)
+	}
+	if records[0].OwnerToken != "helper-test-token" {
+		t.Fatalf("record owner = %q, want helper-test-token", records[0].OwnerToken)
+	}
+}
+
+// TestResolveMultipartMediaImageHelperNoFile — when the multipart
+// body has no image part at all (pure t2i/t2v case), the helper
+// returns ("", nil) so the handler falls through to the
+// resolveMediaInputImage(r.Context(), "", auth) → nil path.
+func TestResolveMultipartMediaImageHelperNoFile(t *testing.T) {
+	app := newMediaTestApp(t)
+	body := &bytes.Buffer{}
+	mw := multipart.NewWriter(body)
+	if err := mw.WriteField("prompt", "text-only prompt"); err != nil {
+		t.Fatalf("write field: %v", err)
+	}
+	if err := mw.Close(); err != nil {
+		t.Fatalf("close multipart writer: %v", err)
+	}
+	req := httptest.NewRequest("POST", "/v1/images/generations", body)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+
+	auth := &AuthContext{Token: "helper-test-token"}
+	fileID, err := app.resolveMultipartMediaImage(context.Background(), req, auth)
+	if err != nil {
+		t.Fatalf("resolveMultipartMediaImage (no file): %v", err)
+	}
+	if fileID != "" {
+		t.Fatalf("fileID = %q, want empty", fileID)
+	}
+	records, err := app.loadUploadedLocalFiles()
+	if err != nil {
+		t.Fatalf("loadUploadedLocalFiles: %v", err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("expected 0 saved records (no file part), got %d", len(records))
+	}
+}
+
+// TestIsMultipartMediaRequest pins the small header-parsing helper
+// used to choose between the JSON and multipart branches. It must
+// tolerate the `boundary=…` parameter that real clients add and be
+// case-insensitive (HTTP headers are case-insensitive; the actual
+// value of Content-Type is normalized by net/http but we still want
+// the EqualFold path tested).
+func TestIsMultipartMediaRequest(t *testing.T) {
+	cases := []struct {
+		name        string
+		contentType string
+		want        bool
+	}{
+		{"plain multipart", "multipart/form-data", true},
+		{"with boundary", "multipart/form-data; boundary=----abc", true},
+		{"uppercase prefix", "MULTIPART/FORM-DATA", true},
+		{"with extra spaces", " multipart/form-data ; boundary=x", true},
+		{"application/json", "application/json", false},
+		{"text/plain", "text/plain", false},
+		{"empty", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest("POST", "/x", nil)
+			if tc.contentType != "" {
+				req.Header.Set("Content-Type", tc.contentType)
+			}
+			if got := isMultipartMediaRequest(req); got != tc.want {
+				t.Fatalf("contentType=%q: got %v, want %v", tc.contentType, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestMultipartFormToMap pins the helper that flattens parsed
+// multipart values into the body map shape. It must:
+//   - return an empty (non-nil) map when no values are present
+//   - keep only the first value when a key appears multiple times
+//   - leave MultipartForm untouched
+func TestMultipartFormToMap(t *testing.T) {
+	t.Run("empty form", func(t *testing.T) {
+		req := httptest.NewRequest("POST", "/x", nil)
+		body := multipartFormToMap(req)
+		if body == nil {
+			t.Fatalf("expected non-nil map")
+		}
+		if len(body) != 0 {
+			t.Fatalf("expected empty map, got %v", body)
+		}
+	})
+
+	t.Run("values flattened", func(t *testing.T) {
+		body := &bytes.Buffer{}
+		mw := multipart.NewWriter(body)
+		_ = mw.WriteField("prompt", "hello")
+		_ = mw.WriteField("size", "1024x1024")
+		_ = mw.Close()
+		req := httptest.NewRequest("POST", "/x", body)
+		req.Header.Set("Content-Type", mw.FormDataContentType())
+		if err := req.ParseMultipartForm(1 << 20); err != nil {
+			t.Fatalf("ParseMultipartForm: %v", err)
+		}
+		m := multipartFormToMap(req)
+		if m["prompt"] != "hello" {
+			t.Fatalf("prompt = %v, want hello", m["prompt"])
+		}
+		if m["size"] != "1024x1024" {
+			t.Fatalf("size = %v, want 1024x1024", m["size"])
+		}
+	})
+
+	t.Run("first value wins on duplicate key", func(t *testing.T) {
+		body := &bytes.Buffer{}
+		mw := multipart.NewWriter(body)
+		_ = mw.WriteField("prompt", "first")
+		_ = mw.WriteField("prompt", "second")
+		_ = mw.Close()
+		req := httptest.NewRequest("POST", "/x", body)
+		req.Header.Set("Content-Type", mw.FormDataContentType())
+		if err := req.ParseMultipartForm(1 << 20); err != nil {
+			t.Fatalf("ParseMultipartForm: %v", err)
+		}
+		m := multipartFormToMap(req)
+		if m["prompt"] != "first" {
+			t.Fatalf("prompt = %v, want first", m["prompt"])
+		}
+	})
 }

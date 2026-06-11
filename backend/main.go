@@ -20,6 +20,7 @@ import (
 	"math"
 	mathrand "math/rand"
 	"mime"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"net/url"
@@ -5665,9 +5666,21 @@ func (app *App) handleImages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body map[string]any
-	if err := decodeJSON(r, &body); err != nil {
-		writeError(w, http.StatusBadRequest, "Invalid JSON body")
-		return
+	if isMultipartMediaRequest(r) {
+		fileID, err := app.resolveMultipartMediaImage(r.Context(), r, auth)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		body = multipartFormToMap(r)
+		if fileID != "" {
+			body["image"] = fileID
+		}
+	} else {
+		if err := decodeJSON(r, &body); err != nil {
+			writeError(w, http.StatusBadRequest, "Invalid JSON body")
+			return
+		}
 	}
 	prompt := strings.TrimSpace(stringValue(body, "prompt", ""))
 	if prompt == "" {
@@ -5795,6 +5808,126 @@ func (app *App) resolveMediaInputImage(ctx context.Context, imageField string, a
 		}}, nil
 	}
 	return nil, fmt.Errorf("image must be a data URL, http(s) URL, or file_id (got %q)", truncate(field, 80))
+}
+
+// resolveMultipartMediaImage accepts a multipart/form-data request on
+// /v1/images and /v1/videos and persists the single reference-image part
+// through the same local-file store as /v1/files. It returns the
+// resulting file_id (suitable to feed back into resolveMediaInputImage
+// as the `image` field) or "" when the request has no image part — the
+// caller treats that as a pure t2i/t2v call.
+//
+// Behaviour mirrors handleUploadFile so an OpenAI-style caller can use
+// either endpoint interchangeably:
+//   - 256MB in-memory cap (matches handleUploadFile).
+//   - file part is looked up as "image" first, then "file" as an alias.
+//   - extension is validated against app.settings.ContextAllowedUserExts.
+//   - the upload is capped at 128MB via io.LimitReader.
+//   - the saved record is owned by auth.Token so it can be looked up
+//     by the same caller later.
+//
+// ParseMultipartForm is called here so the rest of the handler can
+// safely call r.FormValue / r.MultipartForm.Value afterwards. Field
+// extraction (prompt / model / n / size / …) is intentionally NOT
+// performed here — the handler keeps its existing field-extraction
+// path so JSON and multipart stay in lockstep.
+func (app *App) resolveMultipartMediaImage(ctx context.Context, r *http.Request, auth *AuthContext) (string, error) {
+	if err := r.ParseMultipartForm(256 << 20); err != nil {
+		return "", err
+	}
+	header, err := pickMultipartMediaFileHeader(r)
+	if err != nil {
+		return "", err
+	}
+	if header == nil {
+		// No image part present — treat as a pure t2i/t2v call.
+		return "", nil
+	}
+	file, err := header.Open()
+	if err != nil {
+		return "", fmt.Errorf("open image part: %w", err)
+	}
+	defer file.Close()
+
+	ext := fileExt(header.Filename)
+	if !splitExts(app.settings.ContextAllowedUserExts)[ext] {
+		return "", fmt.Errorf("Unsupported file extension: %s", ext)
+	}
+	raw, err := io.ReadAll(io.LimitReader(file, 128<<20+1))
+	if err != nil {
+		return "", fmt.Errorf("File exceeds 128MB limit: %w", err)
+	}
+	if int64(len(raw)) > 128<<20 {
+		return "", fmt.Errorf("File exceeds 128MB limit")
+	}
+	if len(raw) == 0 {
+		return "", fmt.Errorf("Empty file")
+	}
+	contentType := header.Header.Get("Content-Type")
+	if contentType == "" {
+		contentType = mime.TypeByExtension("." + ext)
+	}
+	ownerToken := ""
+	if auth != nil {
+		ownerToken = auth.Token
+	}
+	record, err := app.saveLocalBytes(header.Filename, contentType, raw, "media-multipart", "user-upload", ownerToken, false)
+	if err != nil {
+		return "", fmt.Errorf("save uploaded media: %w", err)
+	}
+	return record.ID, nil
+}
+
+// pickMultipartMediaFileHeader returns the first present image-style
+// file part from the request, looking at "image" first then "file" as
+// an OpenAI-style alias. A nil header with a nil error means the
+// request simply has no image part (pure t2i/t2v). A non-nil error
+// means the part is present but malformed and should be rejected.
+func pickMultipartMediaFileHeader(r *http.Request) (*multipart.FileHeader, error) {
+	if _, h, err := r.FormFile("image"); err == nil {
+		return h, nil
+	} else if !errors.Is(err, http.ErrMissingFile) {
+		return nil, err
+	}
+	if _, h, err := r.FormFile("file"); err == nil {
+		return h, nil
+	} else if !errors.Is(err, http.ErrMissingFile) {
+		return nil, err
+	}
+	return nil, nil
+}
+
+// isMultipartMediaRequest reports whether the request advertises a
+// multipart/form-data body. The check tolerates the optional
+// `boundary=…` parameter that real browsers and curl add.
+func isMultipartMediaRequest(r *http.Request) bool {
+	ct := r.Header.Get("Content-Type")
+	if i := strings.IndexByte(ct, ';'); i >= 0 {
+		ct = ct[:i]
+	}
+	return strings.EqualFold(strings.TrimSpace(ct), "multipart/form-data")
+}
+
+// multipartFormToMap flattens the request's already-parsed
+// multipart/form-data values into a map[string]any compatible with the
+// downstream JSON body shape. The first value wins when a key appears
+// multiple times. Returns an empty map (not nil) when no values are
+// present, so the caller's stringValue/intValue helpers behave like
+// the JSON path. The request must have been ParseMultipartForm'd
+// first — handleImages / handleVideos call
+// resolveMultipartMediaImage (which parses) before calling this.
+func multipartFormToMap(r *http.Request) map[string]any {
+	body := map[string]any{}
+	if r.MultipartForm == nil {
+		return body
+	}
+	for k, vs := range r.MultipartForm.Value {
+		if len(vs) == 0 {
+			continue
+		}
+		body[k] = vs[0]
+	}
+	return body
 }
 
 func (app *App) prepareMediaFilesForUpstream(ctx context.Context, acc *Account, files []map[string]any) ([]map[string]any, error) {
@@ -5934,9 +6067,21 @@ func (app *App) handleVideos(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body map[string]any
-	if err := decodeJSON(r, &body); err != nil {
-		writeError(w, http.StatusBadRequest, "Invalid JSON body")
-		return
+	if isMultipartMediaRequest(r) {
+		fileID, err := app.resolveMultipartMediaImage(r.Context(), r, auth)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		body = multipartFormToMap(r)
+		if fileID != "" {
+			body["image"] = fileID
+		}
+	} else {
+		if err := decodeJSON(r, &body); err != nil {
+			writeError(w, http.StatusBadRequest, "Invalid JSON body")
+			return
+		}
 	}
 	prompt := strings.TrimSpace(stringValue(body, "prompt", ""))
 	if prompt == "" {
