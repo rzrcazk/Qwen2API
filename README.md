@@ -191,6 +191,123 @@ Do not commit real secrets. `.env.example` intentionally contains empty values a
 | `HOST_DATA_DIR`, `HOST_LOGS_DIR` | Host paths mounted into Docker as `/app/data` and `/app/logs`. Defaults are `./data` and `./logs`. |
 | `DATA_DIR`, `LOGS_DIR` | Local non-Docker path overrides. Leave empty to use the current project directory. |
 
+### 3. Media Generation Endpoints (t2i / i2i / t2v / i2v)
+
+Both media endpoints accept an optional OpenAI-style `image` field so you can drive pure text-to-media (`t2i` / `t2v`) or image-conditioned calls (`i2i` / `i2v`) through the same surface. The `image` field accepts three equivalent shapes:
+
+- a `data:` URL (`data:image/png;base64,...`) — embed the reference directly in the request body
+- a public `http(s)://` URL the upstream can fetch directly
+- a `file_id` returned by `POST /v1/files` (multipart upload; the file must be owned by the same downstream `QWEN_API_KEY`)
+
+The default model is `qwen3.7-plus`. Legacy aliases (`dall-e-3`, `gpt-image-1`, `sora`, `qwen-image-plus`, `qwen-video-plus`, …) are still accepted and resolve to the same upstream.
+
+All three examples below assume the gateway is running on `http://127.0.0.1:7860` and that you have exported your downstream key:
+
+```bash
+export QWEN_API_KEY=sk-your-downstream-key
+```
+
+#### a. Pure text-to-image (t2i, backwards compatible)
+
+```bash
+curl -sS http://127.0.0.1:7860/v1/images/generations \
+  -H "Authorization: Bearer $QWEN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "a friendly red panda sitting in bamboo, soft sunlight",
+    "n": 1,
+    "size": "1024x1024",
+    "model": "qwen-image-plus"
+  }'
+```
+
+Successful response (`200 OK`):
+
+```json
+{
+  "created": 1718000000,
+  "data": [
+    {
+      "url": "https://cdn.qwenlm.ai/.../image.png",
+      "revised_prompt": "a friendly red panda sitting in bamboo, soft sunlight",
+      "size": "1024x1024",
+      "ratio": "1:1",
+      "width": 1024,
+      "height": 1024
+    }
+  ]
+}
+```
+
+#### b. Image-to-image (i2i, data URL)
+
+The reference image is embedded directly in the request body. Useful for one-shot edits when the file is small (a few hundred KiB or less).
+
+```bash
+curl -sS http://127.0.0.1:7860/v1/images/generations \
+  -H "Authorization: Bearer $QWEN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "give the red panda a straw hat",
+    "image": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAA...",
+    "size": "1024x1024",
+    "model": "qwen-image-plus"
+  }'
+```
+
+The response shape is identical to the t2i case. The upstream will treat the input as a multimodal reference; the chat type flips from `image_gen` to the i2i variant automatically.
+
+#### c. Image-to-video (i2v, via `file_id`)
+
+`/v1/videos/generations` follows the same pattern. For larger reference images, upload once to `/v1/files` and reuse the returned `file_id` (also useful when the same reference is reused across many requests).
+
+**Step 1 — upload the reference image** (multipart, max 128 MiB):
+
+```bash
+FILE_ID=$(curl -sS http://127.0.0.1:7860/v1/files \
+  -H "Authorization: Bearer $QWEN_API_KEY" \
+  -F "file=@./reference.png;type=image/png" \
+  | jq -r .id)
+
+echo "Uploaded: $FILE_ID"
+```
+
+**Step 2 — request the i2v generation**:
+
+```bash
+curl -sS http://127.0.0.1:7860/v1/videos/generations \
+  -H "Authorization: Bearer $QWEN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"prompt\": \"the red panda waves hello, slow camera pan\",
+    \"image\": \"$FILE_ID\",
+    \"size\": \"1280x720\",
+    \"duration\": 5,
+    \"model\": \"qwen-video-plus\"
+  }"
+```
+
+Successful response (`200 OK`):
+
+```json
+{
+  "created": 1718000000,
+  "data": [
+    {
+      "url": "https://cdn.qwenlm.ai/.../video.mp4",
+      "revised_prompt": "the red panda waves hello, slow camera pan",
+      "size": "1280x720",
+      "ratio": "16:9",
+      "width": 1280,
+      "height": 720,
+      "duration": 5
+    }
+  ]
+}
+```
+
+For a pure `t2v` call, omit the `image` field entirely — the chat type stays `t2v` and the behaviour is unchanged from previous releases.
+
 ## 四、开发指南 / Development Guide
 
 ### 1. Requirements

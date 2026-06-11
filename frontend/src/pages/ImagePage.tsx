@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react"
 import { Image as ImageIcon, RefreshCw, Download, Wand2 } from "lucide-react"
 import { Button } from "../components/ui/button"
+import { FileUpload, type FileUploadValue } from "../components/ui/file-upload"
 import { toast } from "sonner"
 import { getAuthHeader } from "../lib/auth"
 import { API_BASE } from "../lib/api"
@@ -58,6 +59,7 @@ export default function ImagePage() {
   const [error, setError] = useState<string | null>(null)
   const [model, setModel] = useState("qwen3.6-plus-image")
   const [imageModels, setImageModels] = useState<ModelOption[]>(FALLBACK_IMAGE_MODELS)
+  const [attachment, setAttachment] = useState<FileUploadValue | null>(null)
 
   const selectedRatio = ASPECT_RATIOS.find(r => r.value === ratio)!
   const sizeStr = `${selectedRatio.w}x${selectedRatio.h}`
@@ -81,6 +83,7 @@ export default function ImagePage() {
     setError(null)
 
     try {
+      const imageRef = attachment?.fileId ?? attachment?.previewUrl
       const res = await fetch(`${API_BASE}/v1/images/generations`, {
         method: "POST",
         headers: { "Content-Type": "application/json", ...getAuthHeader() },
@@ -94,6 +97,7 @@ export default function ImagePage() {
           width: selectedRatio.w,
           height: selectedRatio.h,
           response_format: "url",
+          ...(imageRef ? { image: imageRef } : {}),
         }),
       })
 
@@ -191,6 +195,14 @@ export default function ImagePage() {
           />
           <p className="text-xs text-muted-foreground">Ctrl+Enter 快速生成</p>
         </div>
+
+        <FileUpload
+          value={attachment}
+          onChange={setAttachment}
+          disabled={loading}
+          label="参考图（可选，支持 i2i）"
+          description="上传参考图后会先调用 /v1/files 拿到 file_id 再随请求发出"
+        />
 
         <div className="flex flex-wrap gap-4 items-end">
           <div className="space-y-1.5 min-w-[260px]">

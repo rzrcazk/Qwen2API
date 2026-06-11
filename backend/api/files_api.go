@@ -8,6 +8,7 @@ import (
 func FileRoutes() []RouteSpec {
 	return []RouteSpec{
 		{Method: "POST", Path: "/v1/files", Auth: "api_key", Description: "upload file for context"},
+		{Method: "GET", Path: "/v1/files/{file_id}", Auth: "api_key", Description: "fetch uploaded file content"},
 		{Method: "DELETE", Path: "/v1/files/{file_id}", Auth: "api_key", Description: "delete uploaded file"},
 	}
 }

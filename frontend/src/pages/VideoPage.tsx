@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react"
 import { Download, Film, RefreshCw, Video as VideoIcon, Wand2 } from "lucide-react"
 import { Button } from "../components/ui/button"
+import { FileUpload, type FileUploadValue } from "../components/ui/file-upload"
 import { toast } from "sonner"
 import { getAuthHeader } from "../lib/auth"
 import { API_BASE } from "../lib/api"
@@ -61,6 +62,7 @@ export default function VideoPage() {
   const [error, setError] = useState<string | null>(null)
   const [model, setModel] = useState("qwen3.6-plus-video")
   const [videoModels, setVideoModels] = useState<ModelOption[]>(FALLBACK_VIDEO_MODELS)
+  const [attachment, setAttachment] = useState<FileUploadValue | null>(null)
 
   const selectedRatio = ASPECT_RATIOS.find(r => r.value === ratio)!
   const sizeStr = `${selectedRatio.w}x${selectedRatio.h}`
@@ -84,6 +86,7 @@ export default function VideoPage() {
     setError(null)
 
     try {
+      const imageRef = attachment?.fileId ?? attachment?.previewUrl
       const res = await fetch(`${API_BASE}/v1/videos/generations`, {
         method: "POST",
         headers: { "Content-Type": "application/json", ...getAuthHeader() },
@@ -98,6 +101,7 @@ export default function VideoPage() {
           height: selectedRatio.h,
           duration,
           response_format: "url",
+          ...(imageRef ? { image: imageRef } : {}),
         }),
       })
 
@@ -174,6 +178,14 @@ export default function VideoPage() {
           />
           <p className="text-xs text-muted-foreground">Ctrl+Enter 快速生成</p>
         </div>
+
+        <FileUpload
+          value={attachment}
+          onChange={setAttachment}
+          disabled={loading}
+          label="参考图（可选，支持 i2v）"
+          description="上传参考图后会先调用 /v1/files 拿到 file_id 再随请求发出"
+        />
 
         <div className="flex flex-wrap gap-4 items-end">
           <div className="space-y-1.5 min-w-[260px]">

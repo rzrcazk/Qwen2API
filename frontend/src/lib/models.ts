@@ -33,11 +33,11 @@ export const FALLBACK_CHAT_MODELS: ModelOption[] = [
 ]
 
 export const FALLBACK_IMAGE_MODELS: ModelOption[] = [
-  { id: "qwen3.6-plus-image", base_model: "qwen3.6-plus", family: "qwen3.6", mode: "image", display_name: "qwen3.6-plus image", capabilities: { image_gen: true } },
+  { id: "qwen3.7-plus-image", base_model: "qwen3.7-plus", family: "qwen3.7", mode: "image", display_name: "qwen3.7-plus image", capabilities: { image_gen: true } },
 ]
 
 export const FALLBACK_VIDEO_MODELS: ModelOption[] = [
-  { id: "qwen3.6-plus-video", base_model: "qwen3.6-plus", family: "qwen3.6", mode: "video", display_name: "qwen3.6-plus video", capabilities: { video_gen: true } },
+  { id: "qwen3.7-plus-video", base_model: "qwen3.7-plus", family: "qwen3.7", mode: "video", display_name: "qwen3.7-plus video", capabilities: { video_gen: true } },
 ]
 
 export const CAPABILITY_LABELS: Array<{ key: keyof ModelCapability; label: string }> = [

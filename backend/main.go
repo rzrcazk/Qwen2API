@@ -8,6 +8,7 @@ import (
 	"context"
 	cryptorand "crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -2403,6 +2404,8 @@ func (app *App) routes() http.Handler {
 	mux.HandleFunc("POST /videos/generations", app.handleVideos)
 	mux.HandleFunc("POST /v1/files", app.handleUploadFile)
 	mux.HandleFunc("POST /api/files/upload", app.handleUploadFile)
+	mux.HandleFunc("GET /v1/files/{file_id}", app.handleGetFile)
+	mux.HandleFunc("GET /api/files/{file_id}", app.handleGetFile)
 	mux.HandleFunc("DELETE /v1/files/{file_id}", app.handleDeleteFile)
 	mux.HandleFunc("DELETE /api/files/{file_id}", app.handleDeleteFile)
 
@@ -5547,6 +5550,81 @@ func (app *App) handleUploadFile(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (app *App) handleGetFile(w http.ResponseWriter, r *http.Request) {
+	auth, ok := app.resolveAuth(w, r)
+	if !ok {
+		return
+	}
+	fileID := strings.TrimSpace(r.PathValue("file_id"))
+	if fileID == "" {
+		writeError(w, http.StatusBadRequest, "file_id is required")
+		return
+	}
+	records, err := app.loadUploadedLocalFiles()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	var found *UploadedLocalFileRecord
+	for i := range records {
+		if records[i].ID == fileID {
+			found = &records[i]
+			break
+		}
+	}
+	if found == nil {
+		writeError(w, http.StatusNotFound, "File not found")
+		return
+	}
+	if found.OwnerToken != "" && found.OwnerToken != auth.Token {
+		writeError(w, http.StatusForbidden, "Forbidden")
+		return
+	}
+	if strings.TrimSpace(found.Path) == "" {
+		writeError(w, http.StatusGone, "File content is no longer available")
+		return
+	}
+	// Path safety: record.Path must live inside app.settings.ContextGeneratedDir.
+	// Reject any record whose path escapes the directory (defence in depth — the
+	// save side already constrains paths, but a tampered store must not let an
+	// attacker read arbitrary files).
+	allowed := normalizeWorkspacePath(app.settings.ContextGeneratedDir)
+	target := normalizeWorkspacePath(found.Path)
+	if allowed == "" || target == "" {
+		writeError(w, http.StatusForbidden, "Forbidden")
+		return
+	}
+	if !strings.EqualFold(target, allowed) &&
+		!strings.HasPrefix(strings.ToLower(target), strings.ToLower(allowed)+string(filepath.Separator)) {
+		writeError(w, http.StatusForbidden, "Forbidden")
+		return
+	}
+	raw, err := os.ReadFile(found.Path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			writeError(w, http.StatusNotFound, "File content is no longer available")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	contentType := strings.TrimSpace(found.ContentType)
+	if contentType == "" {
+		contentType = mime.TypeByExtension(filepath.Ext(found.Filename))
+	}
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Content-Length", strconv.Itoa(len(raw)))
+	w.Header().Set("X-File-Id", found.ID)
+	if filename := strings.TrimSpace(found.Filename); filename != "" {
+		w.Header().Set("Content-Disposition", fmt.Sprintf("inline; filename=%q", filename))
+	}
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(raw)
+}
+
 func (app *App) handleDeleteFile(w http.ResponseWriter, r *http.Request) {
 	auth, ok := app.resolveAuth(w, r)
 	if !ok {
@@ -5583,7 +5661,8 @@ func (app *App) handleDeleteFile(w http.ResponseWriter, r *http.Request) {
 }
 
 func (app *App) handleImages(w http.ResponseWriter, r *http.Request) {
-	if _, ok := app.resolveAuth(w, r); !ok {
+	auth, ok := app.resolveAuth(w, r)
+	if !ok {
 		return
 	}
 	var body map[string]any
@@ -5605,7 +5684,18 @@ func (app *App) handleImages(w http.ResponseWriter, r *http.Request) {
 	promptText := "请调用图片生成能力直接生成图片，不要只输出文字描述。如果可以生成图片，请返回可访问的图片链接或包含图片链接的结果。\n" +
 		"强制画布尺寸：" + size + " 像素。强制宽高比：" + ratio + "。必须严格按这个尺寸和比例生成，不要裁切成其它比例，不要改成默认尺寸。\n\n用户需求：" + prompt
 
-	urls, lastErr := app.createImageURLs(r.Context(), model, promptText, map[string]any{"size": size, "ratio": ratio, "width": width, "height": height})
+	// Optional i2i: accept an input image via the `image` field. Acceptable
+	// forms: data URL ("data:image/...;base64,..."), http(s):// URL, or a
+	// file_id returned by /v1/files. When set, the input image is attached
+	// to the upstream chat as a multimodal file so the model can reference
+	// (i2i / image edit) it. The prompt-injection block above is unchanged.
+	inputFiles, inputErr := app.resolveMediaInputImage(r.Context(), stringValue(body, "image", ""), auth)
+	if inputErr != nil {
+		writeError(w, http.StatusBadRequest, inputErr.Error())
+		return
+	}
+
+	urls, lastErr := app.createImageURLs(r.Context(), model, promptText, map[string]any{"size": size, "ratio": ratio, "width": width, "height": height}, inputFiles)
 	if lastErr != nil {
 		app.logWarn(r.Context(), "图片生成失败", "error", lastErr)
 		writeError(w, upstreamMediaErrorStatus(lastErr), lastErr.Error())
@@ -5627,7 +5717,84 @@ func (app *App) handleImages(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"created": time.Now().Unix(), "data": data})
 }
 
-func (app *App) createImageURLs(ctx context.Context, model, promptText string, imageOptions map[string]any) ([]string, error) {
+// resolveMediaInputImage turns the OpenAI-style `image` field on a media
+// request into a single upstream file block. It accepts:
+//   - a data URL  ("data:<mime>;base64,<payload>")
+//   - an http(s) URL the upstream can fetch directly
+//   - a file_id  ("file-...") referring to a previously uploaded file owned
+//     by the same auth token (resolved through the Files API store)
+//
+// Returns nil, nil when the field is empty (pure t2i / t2v call). Any other
+// shape is rejected with a 400-friendly error so the caller can surface it
+// verbatim. The file block matches the shape the upstream
+// `BuildChatPayload` already accepts ({"type":"image_url","image_url":{"url":...}})
+// so the existing pipeline does not need further changes.
+func (app *App) resolveMediaInputImage(ctx context.Context, imageField string, auth *AuthContext) ([]map[string]any, error) {
+	field := strings.TrimSpace(imageField)
+	if field == "" {
+		return nil, nil
+	}
+	// 1) data URL — pass through unchanged.
+	if strings.HasPrefix(strings.ToLower(field), "data:") {
+		return []map[string]any{{
+			"type":      "image_url",
+			"image_url": map[string]any{"url": field},
+		}}, nil
+	}
+	// 2) http(s) URL — pass through.
+	lower := strings.ToLower(field)
+	if strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://") {
+		return []map[string]any{{
+			"type":      "image_url",
+			"image_url": map[string]any{"url": field},
+		}}, nil
+	}
+	// 3) file_id — look up in the uploaded file store owned by auth.Token.
+	if strings.HasPrefix(field, "file-") {
+		ownerToken := ""
+		if auth != nil {
+			ownerToken = auth.Token
+		}
+		record, err := app.getUploadedLocalFile(field, ownerToken)
+		if err != nil {
+			return nil, fmt.Errorf("image file_id lookup failed: %w", err)
+		}
+		if record == nil {
+			return nil, fmt.Errorf("image file_id not found: %s", field)
+		}
+		// Defence in depth: refuse to read a record whose on-disk path is
+		// outside the configured ContextGeneratedDir, even if the record
+		// claims to be owned by this token.
+		allowed := normalizeWorkspacePath(app.settings.ContextGeneratedDir)
+		target := normalizeWorkspacePath(record.Path)
+		if allowed == "" || target == "" {
+			return nil, fmt.Errorf("image file_id is not accessible")
+		}
+		if !strings.EqualFold(target, allowed) &&
+			!strings.HasPrefix(strings.ToLower(target), strings.ToLower(allowed)+string(filepath.Separator)) {
+			return nil, fmt.Errorf("image file_id is not accessible")
+		}
+		raw, err := os.ReadFile(record.Path)
+		if err != nil {
+			return nil, fmt.Errorf("read image file_id content failed: %w", err)
+		}
+		mimeType := strings.TrimSpace(record.ContentType)
+		if mimeType == "" {
+			mimeType = mime.TypeByExtension(filepath.Ext(record.Filename))
+		}
+		if mimeType == "" {
+			mimeType = "application/octet-stream"
+		}
+		dataURL := fmt.Sprintf("data:%s;base64,%s", mimeType, base64.StdEncoding.EncodeToString(raw))
+		return []map[string]any{{
+			"type":      "image_url",
+			"image_url": map[string]any{"url": dataURL},
+		}}, nil
+	}
+	return nil, fmt.Errorf("image must be a data URL, http(s) URL, or file_id (got %q)", truncate(field, 80))
+}
+
+func (app *App) createImageURLs(ctx context.Context, model, promptText string, imageOptions map[string]any, files []map[string]any) ([]string, error) {
 	var lastErr error
 	attempts := app.mediaRetryAttempts()
 	for attempt := 0; attempt < attempts; attempt++ {
@@ -5651,7 +5818,7 @@ func (app *App) createImageURLs(ctx context.Context, model, promptText string, i
 			defer asyncDeleteChat(app.client, acc.Token, chatID)
 			setRequestLogFields(ctx, "chat_id", chatID)
 
-			payload := buildChatPayload(chatID, model, promptText, false, nil, "image_gen", imageOptions, nil, false)
+			payload := buildChatPayload(chatID, model, promptText, false, files, "image_gen", imageOptions, nil, false)
 			parts := []string{}
 			if err := app.client.StreamChat(ctx, acc.Token, chatID, payload, func(evt UpstreamEvent) error {
 				if evt.Content != "" {
@@ -5717,7 +5884,8 @@ func (app *App) createImageURLs(ctx context.Context, model, promptText string, i
 }
 
 func (app *App) handleVideos(w http.ResponseWriter, r *http.Request) {
-	if _, ok := app.resolveAuth(w, r); !ok {
+	auth, ok := app.resolveAuth(w, r)
+	if !ok {
 		return
 	}
 	var body map[string]any
@@ -5738,7 +5906,24 @@ func (app *App) handleVideos(w http.ResponseWriter, r *http.Request) {
 	setRequestLogFields(r.Context(), "surface", "videos", "requested_model", stringValue(body, "model", ""), "resolved_model", model, "stream", "false", "tool_enabled", "false", "prompt_len", len(prompt))
 	app.logInfo(r.Context(), "视频生成请求解析完成", "size", size, "ratio", ratio, "width", width, "height", height, "duration", duration, "n", n)
 	promptText := fmt.Sprintf("%s\n\n视频要求：生成 %d 秒视频，宽高比 %s，参考画面尺寸 %s。", prompt, duration, ratio, size)
-	urls, lastErr := app.createVideoURLs(r.Context(), model, promptText, map[string]any{"size": size, "ratio": ratio, "width": width, "height": height, "duration": duration})
+
+	// Optional i2v: attach an input image for image-to-video style calls.
+	// Accepts the same three shapes (data URL, http(s) URL, file_id) as the
+	// i2i image path. When set, the file is attached to the upstream chat
+	// so the model can use it as the first frame / reference.
+	// When the input image is provided we signal i2v to the upstream; for
+	// a pure t2v call the chat type stays "t2v" so behaviour is unchanged.
+	inputFiles, inputErr := app.resolveMediaInputImage(r.Context(), stringValue(body, "image", ""), auth)
+	if inputErr != nil {
+		writeError(w, http.StatusBadRequest, inputErr.Error())
+		return
+	}
+	chatType := "t2v"
+	if len(inputFiles) > 0 {
+		chatType = "i2v"
+	}
+
+	urls, lastErr := app.createVideoURLs(r.Context(), model, promptText, map[string]any{"size": size, "ratio": ratio, "width": width, "height": height, "duration": duration}, inputFiles, chatType)
 	if lastErr != nil {
 		app.logWarn(r.Context(), "视频生成失败", "error", lastErr)
 		writeError(w, upstreamMediaErrorStatus(lastErr), lastErr.Error())
@@ -5760,7 +5945,7 @@ func (app *App) handleVideos(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"created": time.Now().Unix(), "data": data})
 }
 
-func (app *App) createVideoURLs(ctx context.Context, model, promptText string, videoOptions map[string]any) ([]string, error) {
+func (app *App) createVideoURLs(ctx context.Context, model, promptText string, videoOptions map[string]any, files []map[string]any, chatType string) ([]string, error) {
 	var lastErr error
 	attempts := app.mediaRetryAttempts()
 	for attempt := 0; attempt < attempts; attempt++ {
@@ -5774,7 +5959,7 @@ func (app *App) createVideoURLs(ctx context.Context, model, promptText string, v
 			defer app.accounts.Release(acc)
 			setRequestLogFields(ctx, "account", acc.Email)
 			app.logInfo(ctx, "视频生成开始尝试", "attempt", attempt+1, "model", model)
-			chatID, err = app.client.CreateChat(ctx, acc.Token, model, "t2v")
+			chatID, err = app.client.CreateChat(ctx, acc.Token, model, chatType)
 			if err != nil {
 				app.classifyAccountErrorFor(acc, err, accountUsageVideo)
 				lastErr = err
@@ -5784,7 +5969,7 @@ func (app *App) createVideoURLs(ctx context.Context, model, promptText string, v
 			defer asyncDeleteChat(app.client, acc.Token, chatID)
 			setRequestLogFields(ctx, "chat_id", chatID)
 
-			payload := buildChatPayload(chatID, model, promptText, false, nil, "t2v", videoOptions, nil, false)
+			payload := buildChatPayload(chatID, model, promptText, false, files, chatType, videoOptions, nil, false)
 			payload["stream"] = false
 			status, body, err := app.client.PostChatCompletionOnce(ctx, acc.Token, chatID, payload, 90*time.Second)
 			if err != nil {
@@ -5935,18 +6120,30 @@ func mediaDimensions(size string) (int, int) {
 func resolveMediaModel(requested string, image bool) string {
 	requested = strings.TrimSpace(requested)
 	if requested == "" {
-		return "qwen3.6-plus"
+		return "qwen3.7-plus"
 	}
 	aliases := map[string]string{
-		"dall-e-3": "qwen3.6-plus", "dall-e-2": "qwen3.6-plus", "gpt-image-1": "qwen3.6-plus",
-		"qwen-image": "qwen3.6-plus", "qwen-image-plus": "qwen3.6-plus", "qwen-image-turbo": "qwen3.6-plus",
-		"qwen-video": "qwen3.6-plus", "qwen-video-plus": "qwen3.6-plus", "qwen-video-turbo": "qwen3.6-plus",
-		"sora": "qwen3.6-plus", "sora-2": "qwen3.6-plus",
+		// OpenAI / Sora family → qwen3.7-plus
+		"dall-e-3": "qwen3.7-plus", "dall-e-2": "qwen3.7-plus", "gpt-image-1": "qwen3.7-plus",
+		"gpt-image-1-mini": "qwen3.7-plus",
+		"qwen-image": "qwen3.7-plus", "qwen-image-plus": "qwen3.7-plus", "qwen-image-turbo": "qwen3.7-plus",
+		"qwen-image-edit-plus": "qwen3.7-plus",
+		"qwen-video": "qwen3.7-plus", "qwen-video-plus": "qwen3.7-plus", "qwen-video-turbo": "qwen3.7-plus",
+		"sora": "qwen3.7-plus", "sora-2": "qwen3.7-plus",
+		// qwen3.7-plus family variants → qwen3.7-plus base
+		"qwen3.7-plus": "qwen3.7-plus",
+		"qwen3.7-plus-image": "qwen3.7-plus", "qwen3.7-plus-t2i": "qwen3.7-plus",
+		"qwen3.7-plus-video": "qwen3.7-plus", "qwen3.7-plus-t2v": "qwen3.7-plus",
+		"qwen3.7-plus-thinking": "qwen3.7-plus",
+		"qwen3.7-plus-search": "qwen3.7-plus",
+		"qwen3.7-plus-deep-research": "qwen3.7-plus", "qwen3.7-plus-deep_research": "qwen3.7-plus",
+		"qwen3.7-plus-webdev": "qwen3.7-plus", "qwen3.7-plus-web-dev": "qwen3.7-plus",
+		"qwen3.7-plus-slides": "qwen3.7-plus",
 	}
 	if v, ok := aliases[strings.ToLower(requested)]; ok {
 		return v
 	}
-	mode := parseModelMode(requested, "qwen3.6-plus")
+	mode := parseModelMode(requested, "qwen3.7-plus")
 	return resolveModel(mode.BaseModel)
 }
 
