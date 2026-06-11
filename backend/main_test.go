@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -35,9 +34,9 @@ func newMediaTestApp(t *testing.T) *App {
 	logger := newLogger("error")
 	accountsStore := NewJSONStore(filepath.Join(dir, "accounts.json"), []Account{})
 	settings := Settings{
-		ContextGeneratedDir:     dir,
-		MaxRetries:              1,
-		MaxInflightPerAccount:   1,
+		ContextGeneratedDir:      dir,
+		MaxRetries:               1,
+		MaxInflightPerAccount:    1,
 		AccountReadySetThreshold: 1,
 	}
 	// Manually load the empty default so AcquireFor's pickLockedFor has
@@ -51,10 +50,10 @@ func newMediaTestApp(t *testing.T) *App {
 		t.Fatalf("load account pool: %v", err)
 	}
 	return &App{
-		settings:        settings,
-		logger:          logger,
-		accounts:        pool,
-		usersStore:      NewJSONStore(filepath.Join(dir, "users.json"), []map[string]any{}),
+		settings:          settings,
+		logger:            logger,
+		accounts:          pool,
+		usersStore:        NewJSONStore(filepath.Join(dir, "users.json"), []map[string]any{}),
 		uploadedFileStore: NewJSONStore(filepath.Join(dir, "uploaded.json"), []UploadedLocalFileRecord{}),
 		fileContentCache:  newFileContentCache(),
 	}
@@ -91,6 +90,29 @@ func writeUploadedFile(t *testing.T, app *App, id, filename, contentType, ownerT
 		t.Fatalf("save store: %v", err)
 	}
 	return rec
+}
+
+func TestQwenHeadersIncludeRequestID(t *testing.T) {
+	h := qwenHeaders("test-token")
+	got := strings.TrimSpace(h.Get("x-request-id"))
+	if got == "" {
+		t.Fatalf("qwenHeaders should include non-empty x-request-id")
+	}
+}
+
+func TestUpstreamMediaFileClassMatchesQwenImageShape(t *testing.T) {
+	if got := upstreamUploadKind("image/png"); got != "image" {
+		t.Fatalf("upstreamUploadKind(image/png) = %q, want image", got)
+	}
+	if got := upstreamMediaFileClass("image"); got != "vision" {
+		t.Fatalf("upstreamMediaFileClass(image) = %q, want vision", got)
+	}
+	if got := upstreamUploadKind("application/pdf"); got != "file" {
+		t.Fatalf("upstreamUploadKind(application/pdf) = %q, want file", got)
+	}
+	if got := upstreamMediaFileClass("file"); got != "document" {
+		t.Fatalf("upstreamMediaFileClass(file) = %q, want document", got)
+	}
 }
 
 // TestResolveMediaModel covers the qwen3.6-plus → qwen3.7-plus media
@@ -200,8 +222,11 @@ func TestResolveMediaInputImageDataURL(t *testing.T) {
 		t.Fatalf("expected 1 file block, got %d", len(files))
 	}
 	typ, _ := files[0]["type"].(string)
-	if typ != "image_url" {
-		t.Fatalf("file block type = %q, want image_url", typ)
+	if typ != "image" {
+		t.Fatalf("file block type = %q, want image", typ)
+	}
+	if files[0]["showType"] != "image" || files[0]["file_class"] != "vision" || files[0]["status"] != "uploaded" {
+		t.Fatalf("file shape = %+v, want Qwen image attachment shape", files[0])
 	}
 	inner, ok := files[0]["image_url"].(map[string]any)
 	if !ok {
@@ -210,6 +235,10 @@ func TestResolveMediaInputImageDataURL(t *testing.T) {
 	url, _ := inner["url"].(string)
 	if url != dataURL {
 		t.Fatalf("image_url.url = %q, want passthrough %q", url, dataURL)
+	}
+	topURL, _ := files[0]["url"].(string)
+	if topURL != dataURL {
+		t.Fatalf("url = %q, want passthrough %q", topURL, dataURL)
 	}
 }
 
@@ -247,6 +276,9 @@ func TestResolveMediaInputImageHTTPSURL(t *testing.T) {
 		if len(files) != 1 {
 			t.Fatalf("expected 1 file block for %q, got %d", in, len(files))
 		}
+		if files[0]["type"] != "image" || files[0]["showType"] != "image" || files[0]["file_class"] != "vision" {
+			t.Fatalf("file shape = %+v, want Qwen image attachment shape", files[0])
+		}
 		inner, _ := files[0]["image_url"].(map[string]any)
 		if inner["url"] != in {
 			t.Fatalf("expected passthrough of %q, got %v", in, inner["url"])
@@ -255,17 +287,16 @@ func TestResolveMediaInputImageHTTPSURL(t *testing.T) {
 }
 
 // TestResolveMediaInputImageFileID — a file-… id owned by the calling
-// token must be resolved into a base64 data URL. We seed the store, call
-// the helper, and check the resulting data URL contains the encoded bytes
-// and the right mime.
+// token must be resolved into an internal local-file marker. The actual
+// Qwen URL is produced later after an upstream account is acquired, which
+// prevents large file_id inputs from becoming overlong data URLs.
 func TestResolveMediaInputImageFileID(t *testing.T) {
 	app := newMediaTestApp(t)
 	const (
-		fileID  = "file-test-1"
-		owner   = "owner-token"
-		mime    = "image/png"
-		raw     = "fake-png-bytes"
-		encoded = "ZmFrZS1wbmctYnl0ZXM="
+		fileID = "file-test-1"
+		owner  = "owner-token"
+		mime   = "image/png"
+		raw    = "fake-png-bytes"
 	)
 	writeUploadedFile(t, app, fileID, "cat.png", mime, owner, []byte(raw))
 
@@ -276,11 +307,18 @@ func TestResolveMediaInputImageFileID(t *testing.T) {
 	if len(files) != 1 {
 		t.Fatalf("expected 1 file block, got %d", len(files))
 	}
-	inner, _ := files[0]["image_url"].(map[string]any)
-	url, _ := inner["url"].(string)
-	want := "data:" + mime + ";base64," + encoded
-	if url != want {
-		t.Fatalf("data URL = %q, want %q", url, want)
+	if files[0]["url"] != fileID {
+		t.Fatalf("url = %v, want file_id marker %q", files[0]["url"], fileID)
+	}
+	if files[0]["type"] != "image" || files[0]["showType"] != "image" || files[0]["file_class"] != "vision" {
+		t.Fatalf("file shape = %+v, want Qwen image attachment shape", files[0])
+	}
+	local, ok := files[0][mediaLocalFileRecordKey].(*UploadedLocalFileRecord)
+	if !ok {
+		t.Fatalf("missing local file marker: %T", files[0][mediaLocalFileRecordKey])
+	}
+	if local == nil || local.ID != fileID || local.Filename != "cat.png" || local.ContentType != mime {
+		t.Fatalf("local marker = %+v", local)
 	}
 }
 
@@ -296,17 +334,12 @@ func TestResolveMediaInputImageFileIDMIMEFromExtension(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolveMediaInputImage(file-jpg) error: %v", err)
 	}
-	inner, _ := files[0]["image_url"].(map[string]any)
-	url, _ := inner["url"].(string)
-	if !strings.HasPrefix(url, "data:image/jpeg;base64,") {
-		t.Fatalf("expected data URL with image/jpeg mime, got %q", url)
+	local, ok := files[0][mediaLocalFileRecordKey].(*UploadedLocalFileRecord)
+	if !ok {
+		t.Fatalf("missing local file marker: %T", files[0][mediaLocalFileRecordKey])
 	}
-	decoded, decErr := base64.StdEncoding.DecodeString(strings.TrimPrefix(url, "data:image/jpeg;base64,"))
-	if decErr != nil {
-		t.Fatalf("base64 decode failed: %v", decErr)
-	}
-	if string(decoded) != "jpeg-bytes" {
-		t.Fatalf("decoded bytes = %q, want %q", decoded, "jpeg-bytes")
+	if local == nil || local.ID != "file-jpg" || local.Filename != "puppy.jpg" {
+		t.Fatalf("local marker = %+v", local)
 	}
 }
 
@@ -371,9 +404,9 @@ func TestResolveMediaInputImageFileIDPathEscape(t *testing.T) {
 func TestResolveMediaInputImageInvalid(t *testing.T) {
 	app := newMediaTestApp(t)
 	cases := []string{
-		"file-",            // empty file-… payload after prefix
-		"just-a-word",      // no recognised prefix
-		"ftp://example.com", // non-http(s) scheme
+		"file-",                  // empty file-… payload after prefix
+		"just-a-word",            // no recognised prefix
+		"ftp://example.com",      // non-http(s) scheme
 		"file-no-leading-hyphen", // looks like a file id but no "file-" prefix
 	}
 	for _, in := range cases {

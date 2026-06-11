@@ -8,7 +8,6 @@ import (
 	"context"
 	cryptorand "crypto/rand"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -5727,8 +5726,11 @@ func (app *App) handleImages(w http.ResponseWriter, r *http.Request) {
 // Returns nil, nil when the field is empty (pure t2i / t2v call). Any other
 // shape is rejected with a 400-friendly error so the caller can surface it
 // verbatim. The file block matches the shape the upstream
-// `BuildChatPayload` already accepts ({"type":"image_url","image_url":{"url":...}})
-// so the existing pipeline does not need further changes.
+// `BuildChatPayload` already accepts. Local file_id inputs are kept as
+// internal records until an upstream account is acquired, then uploaded to
+// Qwen OSS so the upstream sees a short remote URL instead of a huge data URL.
+const mediaLocalFileRecordKey = "_qwen2api_local_file_record"
+
 func (app *App) resolveMediaInputImage(ctx context.Context, imageField string, auth *AuthContext) ([]map[string]any, error) {
 	field := strings.TrimSpace(imageField)
 	if field == "" {
@@ -5737,16 +5739,24 @@ func (app *App) resolveMediaInputImage(ctx context.Context, imageField string, a
 	// 1) data URL — pass through unchanged.
 	if strings.HasPrefix(strings.ToLower(field), "data:") {
 		return []map[string]any{{
-			"type":      "image_url",
-			"image_url": map[string]any{"url": field},
+			"type":       "image",
+			"url":        field,
+			"image_url":  map[string]any{"url": field},
+			"showType":   "image",
+			"file_class": "vision",
+			"status":     "uploaded",
 		}}, nil
 	}
 	// 2) http(s) URL — pass through.
 	lower := strings.ToLower(field)
 	if strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://") {
 		return []map[string]any{{
-			"type":      "image_url",
-			"image_url": map[string]any{"url": field},
+			"type":       "image",
+			"url":        field,
+			"image_url":  map[string]any{"url": field},
+			"showType":   "image",
+			"file_class": "vision",
+			"status":     "uploaded",
 		}}, nil
 	}
 	// 3) file_id — look up in the uploaded file store owned by auth.Token.
@@ -5774,24 +5784,52 @@ func (app *App) resolveMediaInputImage(ctx context.Context, imageField string, a
 			!strings.HasPrefix(strings.ToLower(target), strings.ToLower(allowed)+string(filepath.Separator)) {
 			return nil, fmt.Errorf("image file_id is not accessible")
 		}
-		raw, err := os.ReadFile(record.Path)
-		if err != nil {
-			return nil, fmt.Errorf("read image file_id content failed: %w", err)
-		}
-		mimeType := strings.TrimSpace(record.ContentType)
-		if mimeType == "" {
-			mimeType = mime.TypeByExtension(filepath.Ext(record.Filename))
-		}
-		if mimeType == "" {
-			mimeType = "application/octet-stream"
-		}
-		dataURL := fmt.Sprintf("data:%s;base64,%s", mimeType, base64.StdEncoding.EncodeToString(raw))
 		return []map[string]any{{
-			"type":      "image_url",
-			"image_url": map[string]any{"url": dataURL},
+			"type":                  "image",
+			"url":                   record.ID,
+			"image_url":             map[string]any{"url": record.ID},
+			"showType":              "image",
+			"file_class":            "vision",
+			"status":                "uploaded",
+			mediaLocalFileRecordKey: record,
 		}}, nil
 	}
 	return nil, fmt.Errorf("image must be a data URL, http(s) URL, or file_id (got %q)", truncate(field, 80))
+}
+
+func (app *App) prepareMediaFilesForUpstream(ctx context.Context, acc *Account, files []map[string]any) ([]map[string]any, error) {
+	if len(files) == 0 {
+		return files, nil
+	}
+	out := make([]map[string]any, 0, len(files))
+	for _, file := range files {
+		if file == nil {
+			continue
+		}
+		var local *UploadedLocalFileRecord
+		switch v := file[mediaLocalFileRecordKey].(type) {
+		case UploadedLocalFileRecord:
+			local = &v
+		case *UploadedLocalFileRecord:
+			local = v
+		}
+		if local != nil {
+			remote, err := app.uploadLocalMediaFileToUpstream(ctx, acc, *local)
+			if err != nil {
+				return nil, fmt.Errorf("upload media file_id to upstream failed: %w", err)
+			}
+			ref, _ := remote["remote_ref"].(map[string]any)
+			if ref == nil {
+				return nil, fmt.Errorf("upload media file_id to upstream returned no remote_ref")
+			}
+			out = append(out, ref)
+			continue
+		}
+		clean := copyMap(file)
+		delete(clean, mediaLocalFileRecordKey)
+		out = append(out, clean)
+	}
+	return out, nil
 }
 
 func (app *App) createImageURLs(ctx context.Context, model, promptText string, imageOptions map[string]any, files []map[string]any) ([]string, error) {
@@ -5818,7 +5856,14 @@ func (app *App) createImageURLs(ctx context.Context, model, promptText string, i
 			defer asyncDeleteChat(app.client, acc.Token, chatID)
 			setRequestLogFields(ctx, "chat_id", chatID)
 
-			payload := buildChatPayload(chatID, model, promptText, false, files, "image_gen", imageOptions, nil, false)
+			upstreamFiles, err := app.prepareMediaFilesForUpstream(ctx, acc, files)
+			if err != nil {
+				app.classifyAccountErrorFor(acc, err, accountUsageImage)
+				lastErr = err
+				app.logWarn(ctx, "图片生成上传参考图失败", "attempt", attempt+1, "error", err)
+				return
+			}
+			payload := buildChatPayload(chatID, model, promptText, false, upstreamFiles, "image_gen", imageOptions, nil, false)
 			parts := []string{}
 			if err := app.client.StreamChat(ctx, acc.Token, chatID, payload, func(evt UpstreamEvent) error {
 				if evt.Content != "" {
@@ -5969,7 +6014,14 @@ func (app *App) createVideoURLs(ctx context.Context, model, promptText string, v
 			defer asyncDeleteChat(app.client, acc.Token, chatID)
 			setRequestLogFields(ctx, "chat_id", chatID)
 
-			payload := buildChatPayload(chatID, model, promptText, false, files, chatType, videoOptions, nil, false)
+			upstreamFiles, err := app.prepareMediaFilesForUpstream(ctx, acc, files)
+			if err != nil {
+				app.classifyAccountErrorFor(acc, err, accountUsageVideo)
+				lastErr = err
+				app.logWarn(ctx, "视频生成上传参考图失败", "attempt", attempt+1, "error", err)
+				return
+			}
+			payload := buildChatPayload(chatID, model, promptText, false, upstreamFiles, chatType, videoOptions, nil, false)
 			payload["stream"] = false
 			status, body, err := app.client.PostChatCompletionOnce(ctx, acc.Token, chatID, payload, 90*time.Second)
 			if err != nil {
@@ -6126,16 +6178,16 @@ func resolveMediaModel(requested string, image bool) string {
 		// OpenAI / Sora family → qwen3.7-plus
 		"dall-e-3": "qwen3.7-plus", "dall-e-2": "qwen3.7-plus", "gpt-image-1": "qwen3.7-plus",
 		"gpt-image-1-mini": "qwen3.7-plus",
-		"qwen-image": "qwen3.7-plus", "qwen-image-plus": "qwen3.7-plus", "qwen-image-turbo": "qwen3.7-plus",
+		"qwen-image":       "qwen3.7-plus", "qwen-image-plus": "qwen3.7-plus", "qwen-image-turbo": "qwen3.7-plus",
 		"qwen-image-edit-plus": "qwen3.7-plus",
-		"qwen-video": "qwen3.7-plus", "qwen-video-plus": "qwen3.7-plus", "qwen-video-turbo": "qwen3.7-plus",
+		"qwen-video":           "qwen3.7-plus", "qwen-video-plus": "qwen3.7-plus", "qwen-video-turbo": "qwen3.7-plus",
 		"sora": "qwen3.7-plus", "sora-2": "qwen3.7-plus",
 		// qwen3.7-plus family variants → qwen3.7-plus base
-		"qwen3.7-plus": "qwen3.7-plus",
+		"qwen3.7-plus":       "qwen3.7-plus",
 		"qwen3.7-plus-image": "qwen3.7-plus", "qwen3.7-plus-t2i": "qwen3.7-plus",
 		"qwen3.7-plus-video": "qwen3.7-plus", "qwen3.7-plus-t2v": "qwen3.7-plus",
-		"qwen3.7-plus-thinking": "qwen3.7-plus",
-		"qwen3.7-plus-search": "qwen3.7-plus",
+		"qwen3.7-plus-thinking":      "qwen3.7-plus",
+		"qwen3.7-plus-search":        "qwen3.7-plus",
 		"qwen3.7-plus-deep-research": "qwen3.7-plus", "qwen3.7-plus-deep_research": "qwen3.7-plus",
 		"qwen3.7-plus-webdev": "qwen3.7-plus", "qwen3.7-plus-web-dev": "qwen3.7-plus",
 		"qwen3.7-plus-slides": "qwen3.7-plus",
@@ -7896,6 +7948,7 @@ func qwenHeaders(token string) http.Header {
 	h.Set("Referer", qwenBaseURL+"/")
 	h.Set("Origin", qwenBaseURL)
 	h.Set("Connection", "keep-alive")
+	h.Set("x-request-id", randomID())
 	h.Set("sec-ch-ua", `"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"`)
 	h.Set("sec-ch-ua-mobile", "?0")
 	h.Set("sec-ch-ua-platform", `"Windows"`)
