@@ -53,3 +53,9 @@ hermes_tool_stress_sandbox*/
 openclaw_tool_stress_sandbox*/
 Hermes/
 工具链长任务ifacts/
+
+# Local tooling state (not part of the project)
+.harness/
+.mavis/
+.opencode/
+data/
