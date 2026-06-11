@@ -21,11 +21,12 @@ func BuildChatPayload(chatID, model, content string, hasCustomTools bool, files 
 	}
 	ts := time.Now().Unix()
 	isImage := chatType == "image_gen" || chatType == "t2i"
-	isVideo := chatType == "t2v"
+	isVideo := chatType == "t2v" || chatType == "i2v"
 	featureConfig := map[string]any{}
 	messageChatType := chatType
 	subChatType := chatType
 	messageMeta := map[string]any{"subChatType": chatType}
+	var i2vInput map[string]any
 
 	if isImage {
 		ratio := imageRatio(imageOptions)
@@ -46,9 +47,16 @@ func BuildChatPayload(chatID, model, content string, hasCustomTools bool, files 
 			"function_calling": false, "plugins_enabled": true, "video_generation": true,
 			"default_aspect_ratio": ratio,
 		}
-		messageChatType = "t2v"
-		subChatType = "t2v"
-		messageMeta = map[string]any{"subChatType": "t2v", "mode": "video_generation", "aspectRatio": ratio, "size": ratio}
+		messageChatType = chatType
+		subChatType = chatType
+		messageMeta = map[string]any{"subChatType": chatType, "mode": "video_generation", "aspectRatio": ratio, "size": ratio}
+		if chatType == "i2v" {
+			if imageURL := firstFileURL(files); imageURL != "" {
+				i2vInput = map[string]any{"img_url": imageURL}
+				featureConfig["input"] = i2vInput
+				messageMeta["input"] = i2vInput
+			}
+		}
 	} else {
 		thinking := true
 		autoThinking := true
@@ -79,22 +87,46 @@ func BuildChatPayload(chatID, model, content string, hasCustomTools bool, files 
 	if files == nil {
 		files = []map[string]any{}
 	}
+	message := map[string]any{
+		"fid": randomID(), "parentId": nil, "childrenIds": []string{randomID()},
+		"role": "user", "content": content, "user_action": "chat", "files": files,
+		"timestamp": ts, "models": []string{model}, "chat_type": messageChatType,
+		"feature_config": featureConfig, "extra": map[string]any{"meta": messageMeta},
+		"sub_chat_type": subChatType, "parent_id": nil,
+	}
+	if i2vInput != nil {
+		message["input"] = i2vInput
+	}
 	payload := map[string]any{
 		"stream": true, "version": "2.1", "incremental_output": true, "chat_id": chatID,
 		"chat_mode": "normal", "model": model, "parent_id": nil,
-		"messages": []map[string]any{{
-			"fid": randomID(), "parentId": nil, "childrenIds": []string{randomID()},
-			"role": "user", "content": content, "user_action": "chat", "files": files,
-			"timestamp": ts, "models": []string{model}, "chat_type": messageChatType,
-			"feature_config": featureConfig, "extra": map[string]any{"meta": messageMeta},
-			"sub_chat_type": subChatType, "parent_id": nil,
-		}},
+		"messages":  []map[string]any{message},
 		"timestamp": ts,
+	}
+	if i2vInput != nil {
+		payload["input"] = i2vInput
 	}
 	if isImage || isVideo {
 		payload["size"] = imageRatio(imageOptions)
 	}
 	return payload
+}
+
+func firstFileURL(files []map[string]any) string {
+	for _, file := range files {
+		if file == nil {
+			continue
+		}
+		if url, _ := file["url"].(string); url != "" {
+			return url
+		}
+		if imageURL, ok := file["image_url"].(map[string]any); ok {
+			if url, _ := imageURL["url"].(string); url != "" {
+				return url
+			}
+		}
+	}
+	return ""
 }
 
 func imageRatio(options map[string]any) string {

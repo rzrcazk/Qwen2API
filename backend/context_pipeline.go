@@ -932,7 +932,39 @@ func upstreamFileClass(contentType string) string {
 	}
 }
 
+func upstreamUploadKind(contentType string) string {
+	lowered := strings.ToLower(strings.TrimSpace(contentType))
+	switch {
+	case strings.HasPrefix(lowered, "image/"):
+		return "image"
+	case strings.HasPrefix(lowered, "audio/"):
+		return "audio"
+	case strings.HasPrefix(lowered, "video/"):
+		return "video"
+	default:
+		return "file"
+	}
+}
+
+func upstreamMediaFileClass(uploadKind string) string {
+	if uploadKind == "image" {
+		return "vision"
+	}
+	if uploadKind == "" || uploadKind == "file" {
+		return "document"
+	}
+	return uploadKind
+}
+
 func (app *App) uploadLocalFileToUpstream(ctx context.Context, acc *Account, local UploadedLocalFileRecord) (map[string]any, error) {
+	return app.uploadLocalFileToUpstreamWithParse(ctx, acc, local, true)
+}
+
+func (app *App) uploadLocalMediaFileToUpstream(ctx context.Context, acc *Account, local UploadedLocalFileRecord) (map[string]any, error) {
+	return app.uploadLocalFileToUpstreamWithParse(ctx, acc, local, false)
+}
+
+func (app *App) uploadLocalFileToUpstreamWithParse(ctx context.Context, acc *Account, local UploadedLocalFileRecord, parseFile bool) (map[string]any, error) {
 	if app == nil || app.client == nil || acc == nil {
 		return nil, fmt.Errorf("upload prerequisites missing")
 	}
@@ -941,10 +973,14 @@ func (app *App) uploadLocalFileToUpstream(ctx context.Context, acc *Account, loc
 		return nil, err
 	}
 	contentType := firstNonEmpty(local.ContentType, mime.TypeByExtension(filepath.Ext(local.Filename)), "application/octet-stream")
+	uploadKind := "file"
+	if !parseFile {
+		uploadKind = upstreamUploadKind(contentType)
+	}
 	status, text, err := app.client.requestJSON(ctx, http.MethodPost, "/api/v2/files/getstsToken", acc.Token, map[string]any{
 		"filename": local.Filename,
 		"filesize": len(raw),
-		"filetype": "file",
+		"filetype": uploadKind,
 	}, 20*time.Second)
 	if err != nil {
 		return nil, err
@@ -989,48 +1025,51 @@ func (app *App) uploadLocalFileToUpstream(ctx context.Context, acc *Account, loc
 		return nil, err
 	}
 
-	status, text, err = app.client.requestJSON(ctx, http.MethodPost, "/api/v2/files/parse", acc.Token, map[string]any{"file_id": fileID}, 20*time.Second)
-	if err != nil {
-		return nil, err
-	}
-	if status != http.StatusOK {
-		return nil, fmt.Errorf("files/parse failed: %d %s", status, truncate(text, 200))
-	}
-
-	deadline := time.Now().Add(time.Duration(maxInt(app.settings.ContextUploadParseTimeoutSeconds, 1)) * time.Second)
-	parseStatus := "pending"
-	for time.Now().Before(deadline) {
-		status, text, err = app.client.requestJSON(ctx, http.MethodPost, "/api/v2/files/parse/status", acc.Token, map[string]any{"file_id_list": []string{fileID}}, 20*time.Second)
+	parseStatus := "success"
+	if parseFile {
+		status, text, err = app.client.requestJSON(ctx, http.MethodPost, "/api/v2/files/parse", acc.Token, map[string]any{"file_id": fileID}, 20*time.Second)
 		if err != nil {
 			return nil, err
 		}
 		if status != http.StatusOK {
-			return nil, fmt.Errorf("files/parse/status failed: %d %s", status, truncate(text, 200))
+			return nil, fmt.Errorf("files/parse failed: %d %s", status, truncate(text, 200))
 		}
-		var payload map[string]any
-		if err := json.Unmarshal([]byte(text), &payload); err != nil {
-			return nil, err
+
+		deadline := time.Now().Add(time.Duration(maxInt(app.settings.ContextUploadParseTimeoutSeconds, 1)) * time.Second)
+		parseStatus = "pending"
+		for time.Now().Before(deadline) {
+			status, text, err = app.client.requestJSON(ctx, http.MethodPost, "/api/v2/files/parse/status", acc.Token, map[string]any{"file_id_list": []string{fileID}}, 20*time.Second)
+			if err != nil {
+				return nil, err
+			}
+			if status != http.StatusOK {
+				return nil, fmt.Errorf("files/parse/status failed: %d %s", status, truncate(text, 200))
+			}
+			var payload map[string]any
+			if err := json.Unmarshal([]byte(text), &payload); err != nil {
+				return nil, err
+			}
+			rows := anyList(payload["data"])
+			row := map[string]any{}
+			if len(rows) > 0 {
+				row, _ = rows[0].(map[string]any)
+			}
+			parseStatus = anyString(row["status"], "pending")
+			if parseStatus == "success" {
+				break
+			}
+			if parseStatus == "failed" || parseStatus == "error" {
+				return nil, fmt.Errorf("file parse failed: %s", truncate(mustJSON(row), 200))
+			}
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(defaultContextUploadPoll):
+			}
 		}
-		rows := anyList(payload["data"])
-		row := map[string]any{}
-		if len(rows) > 0 {
-			row, _ = rows[0].(map[string]any)
+		if parseStatus != "success" {
+			return nil, fmt.Errorf("file parse timeout: %s", fileID)
 		}
-		parseStatus = anyString(row["status"], "pending")
-		if parseStatus == "success" {
-			break
-		}
-		if parseStatus == "failed" || parseStatus == "error" {
-			return nil, fmt.Errorf("file parse failed: %s", truncate(mustJSON(row), 200))
-		}
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(defaultContextUploadPoll):
-		}
-	}
-	if parseStatus != "success" {
-		return nil, fmt.Errorf("file parse timeout: %s", fileID)
 	}
 
 	nowMillis := time.Now().UnixMilli()
@@ -1039,8 +1078,16 @@ func (app *App) uploadLocalFileToUpstream(ctx context.Context, acc *Account, loc
 		userID = parts[0]
 	}
 	putURL := "https://" + bucketName + "." + endpoint + "/" + strings.TrimLeft(filePathRemote, "/")
+	refType := "file"
+	showType := "file"
+	fileClass := upstreamFileClass(contentType)
+	if !parseFile {
+		refType = uploadKind
+		showType = uploadKind
+		fileClass = upstreamMediaFileClass(uploadKind)
+	}
 	remoteRef := map[string]any{
-		"type": "file",
+		"type": refType,
 		"file": map[string]any{
 			"created_at": nowMillis,
 			"data":       map[string]any{},
@@ -1067,8 +1114,8 @@ func (app *App) uploadLocalFileToUpstream(ctx context.Context, acc *Account, loc
 		"error":           "",
 		"itemId":          randomID(),
 		"file_type":       contentType,
-		"showType":        "file",
-		"file_class":      upstreamFileClass(contentType),
+		"showType":        showType,
+		"file_class":      fileClass,
 		"uploadTaskId":    randomID(),
 	}
 	return map[string]any{

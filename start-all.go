@@ -214,6 +214,10 @@ func findNPMCLI(nodeExe string) (string, error) {
 	candidates = append(candidates,
 		filepath.Join(nodeDir, "node_modules", "npm", "bin", "npm-cli.js"),
 		filepath.Join(filepath.Dir(nodeDir), "node_modules", "npm", "bin", "npm-cli.js"),
+		// Homebrew on macOS / Linux: npm ships under libexec/lib or lib/.
+		// nodeDir is typically .../Cellar/node/<ver>/bin, so the parent is the keg root.
+		filepath.Join(nodeDir, "..", "libexec", "lib", "node_modules", "npm", "bin", "npm-cli.js"),
+		filepath.Join(nodeDir, "..", "lib", "node_modules", "npm", "bin", "npm-cli.js"),
 	)
 	if appData := os.Getenv("APPDATA"); appData != "" {
 		candidates = append(candidates, filepath.Join(appData, "npm", "node_modules", "npm", "bin", "npm-cli.js"))
