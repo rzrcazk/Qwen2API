@@ -1595,6 +1595,6 @@ func (app *App) cleanupContextArtifacts(ctx context.Context) {
 		}
 	}
 	if app != nil {
-		app.logInfo(ctx, "上下文缓存清理完成")
+		app.logDebug(ctx, "上下文缓存清理完成")
 	}
 }

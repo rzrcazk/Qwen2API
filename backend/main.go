@@ -1718,10 +1718,10 @@ func (p *ChatIDPool) cleanup(ctx context.Context, deleteAll bool) {
 	}
 	p.mu.Unlock()
 	for _, item := range expired {
-		p.client.DeleteChat(context.Background(), item.Token, item.ChatID)
+		p.client.DeleteChat(withPrewarmLogContext(context.Background()), item.Token, item.ChatID)
 	}
 	if len(expired) > 0 {
-		logInfo(p.logger, ctx, "清理预热会话", "count", len(expired), "delete_all", deleteAll)
+		logDebug(p.logger, ctx, "清理预热会话", "count", len(expired), "delete_all", deleteAll)
 	}
 }
 
@@ -8210,7 +8210,11 @@ func (c *QwenClient) DeleteChat(ctx context.Context, token, chatID string) bool 
 			c.mu.Lock()
 			c.deleted[chatID] = true
 			c.mu.Unlock()
-			logInfo(c.logger, ctx, "删除上游会话完成", "chat_id", chatID, "attempt", attempt, "status", status)
+			if isPrewarmLogContext(ctx) {
+				logDebug(c.logger, ctx, "删除上游会话完成", "chat_id", chatID, "attempt", attempt, "status", status)
+			} else {
+				logInfo(c.logger, ctx, "删除上游会话完成", "chat_id", chatID, "attempt", attempt, "status", status)
+			}
 			return true
 		}
 		logWarn(c.logger, ctx, "删除上游会话失败", "chat_id", chatID, "attempt", attempt, "status", status, "error", err, "body", truncate(text, 120))
@@ -8631,13 +8635,18 @@ func (app *App) withRequestLogging(next http.Handler) http.Handler {
 		w.Header().Set("X-Request-ID", reqID)
 		recorder := &loggingResponseWriter{ResponseWriter: w}
 
-		app.logInfo(ctx, "请求进入",
+		entryAttrs := []any{
 			"method", r.Method,
 			"path", r.URL.Path,
 			"query", truncate(r.URL.RawQuery, 240),
 			"remote", r.RemoteAddr,
 			"user_agent", truncate(r.UserAgent(), 160),
-		)
+		}
+		if logCtx.Surface == "probe" {
+			app.logDebug(ctx, "请求进入", entryAttrs...)
+		} else {
+			app.logInfo(ctx, "请求进入", entryAttrs...)
+		}
 
 		defer func() {
 			if recovered := recover(); recovered != nil {
@@ -8662,6 +8671,8 @@ func (app *App) withRequestLogging(next http.Handler) http.Handler {
 				app.logError(ctx, "请求完成", attrs...)
 			} else if status >= 400 {
 				app.logWarn(ctx, "请求完成", attrs...)
+			} else if logCtx.Surface == "probe" {
+				app.logDebug(ctx, "请求完成", attrs...)
 			} else {
 				app.logInfo(ctx, "请求完成", attrs...)
 			}
@@ -8804,6 +8815,12 @@ func appendLogAttrs(ctx context.Context, attrs ...any) []any {
 func (app *App) logInfo(ctx context.Context, msg string, attrs ...any) {
 	if app != nil && app.logger != nil {
 		app.logger.Info(msg, appendLogAttrs(ctx, attrs...)...)
+	}
+}
+
+func (app *App) logDebug(ctx context.Context, msg string, attrs ...any) {
+	if app != nil && app.logger != nil {
+		app.logger.Debug(msg, appendLogAttrs(ctx, attrs...)...)
 	}
 }
 
