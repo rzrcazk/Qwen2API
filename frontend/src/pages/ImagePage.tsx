@@ -57,7 +57,7 @@ export default function ImagePage() {
   const [loading, setLoading] = useState(false)
   const [images, setImages] = useState<GeneratedImage[]>([])
   const [error, setError] = useState<string | null>(null)
-  const [model, setModel] = useState("qwen3.6-plus-image")
+  const [model, setModel] = useState("qwen3.7-plus-image")
   const [imageModels, setImageModels] = useState<ModelOption[]>(FALLBACK_IMAGE_MODELS)
   const [attachment, setAttachment] = useState<FileUploadValue | null>(null)
 
@@ -70,7 +70,7 @@ export default function ImagePage() {
       try {
         const options = filterImageModels(await fetchModelOptions())
         setImageModels(options)
-        setModel(current => chooseDefaultModel(options, current, "qwen3.6-plus-image"))
+        setModel(current => chooseDefaultModel(options, current, "qwen3.7-plus-image"))
       } catch {
         // keep fallback image model
       }

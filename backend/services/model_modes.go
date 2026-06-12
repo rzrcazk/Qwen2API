@@ -12,11 +12,11 @@ type ModelMode struct {
 
 func DefaultModelAliases() map[string]string {
 	return map[string]string{
-		"gpt-4o": "qwen3.6-plus", "gpt-4o-mini": "qwen3.5-flash", "gpt-4": "qwen3.6-plus",
-		"gpt-3.5-turbo": "qwen3.5-flash", "gpt-5": "qwen3.6-plus",
-		"claude-sonnet-4-5": "qwen3.6-plus", "claude-3-haiku": "qwen3.5-flash",
-		"gemini-2.5-pro": "qwen3.6-plus", "gemini-2.5-flash": "qwen3.5-flash",
-		"qwen": "qwen3.6-plus", "qwen-plus": "qwen3.6-plus", "qwen-turbo": "qwen3.5-flash",
+		"gpt-4o": "qwen3.7-plus", "gpt-4o-mini": "qwen3.5-flash", "gpt-4": "qwen3.7-plus",
+		"gpt-3.5-turbo": "qwen3.5-flash", "gpt-5": "qwen3.7-plus",
+		"claude-sonnet-4-5": "qwen3.7-plus", "claude-3-haiku": "qwen3.5-flash",
+		"gemini-2.5-pro": "qwen3.7-plus", "gemini-2.5-flash": "qwen3.5-flash",
+		"qwen": "qwen3.7-plus", "qwen-plus": "qwen3.7-plus", "qwen-turbo": "qwen3.5-flash",
 	}
 }
 

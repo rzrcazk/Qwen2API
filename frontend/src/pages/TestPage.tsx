@@ -174,7 +174,7 @@ export default function TestPage() {
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [input, setInput] = useState("")
   const [loading, setLoading] = useState(false)
-  const [model, setModel] = useState("qwen3.6-plus")
+  const [model, setModel] = useState("qwen3.7-plus")
   const [availableModels, setAvailableModels] = useState<ModelOption[]>(FALLBACK_CHAT_MODELS)
   const [stream, setStream] = useState(true)
   const [answerMode, setAnswerMode] = useState<"thinking" | "fast">("thinking")

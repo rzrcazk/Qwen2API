@@ -1487,7 +1487,7 @@ func NewChatIDPool(client *QwenClient, accounts *AccountPool, settings Settings,
 		items:    map[string][]WarmChat{},
 		desired:  map[string]ModelWarmKey{},
 	}
-	pool.RememberModel("qwen3.6-plus", "t2t")
+	pool.RememberModel("qwen3.7-plus", "t2t")
 	return pool
 }
 
@@ -1561,7 +1561,7 @@ func (p *ChatIDPool) RememberModel(model, chatType string) {
 	}
 	model = strings.TrimSpace(model)
 	if model == "" {
-		model = "qwen3.6-plus"
+		model = "qwen3.7-plus"
 	}
 	chatType = normalizeUpstreamChatType(chatType)
 	key := model + "|" + chatType
@@ -1668,6 +1668,7 @@ func (p *ChatIDPool) Fill(ctx context.Context) {
 func (p *ChatIDPool) createWarmChat(ctx context.Context, acc Account, warmKey ModelWarmKey) {
 	fillCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
+	fillCtx = withPrewarmLogContext(fillCtx)
 	chatID, err := p.client.CreateChat(fillCtx, acc.Token, warmKey.Model, warmKey.ChatType)
 	if err != nil {
 		logWarn(p.logger, ctx, "预热会话创建失败", "account", acc.Email, "model", warmKey.Model, "chat_type", warmKey.ChatType, "error", err)
@@ -1682,7 +1683,7 @@ func (p *ChatIDPool) createWarmChat(ctx context.Context, acc Account, warmKey Mo
 	p.items[key] = append(p.items[key], item)
 	cached := len(p.items[key])
 	p.mu.Unlock()
-	logInfo(p.logger, ctx, "预热会话创建成功", "account", acc.Email, "chat_id", chatID, "model", warmKey.Model, "chat_type", warmKey.ChatType, "cached", cached)
+	logDebug(p.logger, ctx, "预热会话创建成功", "account", acc.Email, "chat_id", chatID, "model", warmKey.Model, "chat_type", warmKey.ChatType, "cached", cached)
 }
 
 func (p *ChatIDPool) count(email, model, chatType string) int {
@@ -1882,16 +1883,16 @@ func LoadSettings() Settings {
 }
 
 var modelMap = map[string]string{
-	"gpt-4o": "qwen3.6-plus", "gpt-4o-mini": "qwen3.5-flash", "gpt-4-turbo": "qwen3.6-plus",
-	"gpt-4": "qwen3.6-plus", "gpt-4.1": "qwen3.6-plus", "gpt-4.1-mini": "qwen3.5-flash",
-	"gpt-3.5-turbo": "qwen3.5-flash", "gpt-5": "qwen3.6-plus", "o1": "qwen3.6-plus",
-	"o1-mini": "qwen3.5-flash", "o3": "qwen3.6-plus", "o3-mini": "qwen3.5-flash",
-	"claude-opus-4-6": "qwen3.6-plus", "claude-sonnet-4-5": "qwen3.6-plus",
-	"claude-3-opus": "qwen3.6-plus", "claude-3.5-sonnet": "qwen3.6-plus",
-	"claude-3-sonnet": "qwen3.6-plus", "claude-3-haiku": "qwen3.5-flash",
-	"gemini-2.5-pro": "qwen3.6-plus", "gemini-2.5-flash": "qwen3.5-flash",
-	"qwen": "qwen3.6-plus", "qwen-max": "qwen3.6-plus", "qwen-plus": "qwen3.6-plus",
-	"qwen-turbo": "qwen3.5-flash", "deepseek-chat": "qwen3.6-plus", "deepseek-reasoner": "qwen3.6-plus",
+	"gpt-4o": "qwen3.7-plus", "gpt-4o-mini": "qwen3.5-flash", "gpt-4-turbo": "qwen3.7-plus",
+	"gpt-4": "qwen3.7-plus", "gpt-4.1": "qwen3.7-plus", "gpt-4.1-mini": "qwen3.5-flash",
+	"gpt-3.5-turbo": "qwen3.5-flash", "gpt-5": "qwen3.7-plus", "o1": "qwen3.7-plus",
+	"o1-mini": "qwen3.5-flash", "o3": "qwen3.7-plus", "o3-mini": "qwen3.5-flash",
+	"claude-opus-4-6": "qwen3.7-plus", "claude-sonnet-4-5": "qwen3.7-plus",
+	"claude-3-opus": "qwen3.7-plus", "claude-3.5-sonnet": "qwen3.7-plus",
+	"claude-3-sonnet": "qwen3.7-plus", "claude-3-haiku": "qwen3.5-flash",
+	"gemini-2.5-pro": "qwen3.7-plus", "gemini-2.5-flash": "qwen3.5-flash",
+	"qwen": "qwen3.7-plus", "qwen-max": "qwen3.7-plus", "qwen-plus": "qwen3.7-plus",
+	"qwen-turbo": "qwen3.5-flash", "deepseek-chat": "qwen3.7-plus", "deepseek-reasoner": "qwen3.7-plus",
 }
 
 func resolveModel(name string) string {
@@ -4493,7 +4494,7 @@ func (app *App) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, map[string]any{"error": map[string]any{"message": "Invalid JSON body", "type": "invalid_request_error"}})
 		return
 	}
-	req, err := app.prepareStandardRequest(r.Context(), r, body, "gpt-3.5-turbo", "openai", auth.Token)
+	req, err := app.prepareStandardRequest(r.Context(), r, body, "qwen3.7-plus", "openai", auth.Token)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -4785,7 +4786,7 @@ func (app *App) handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	converted := responsesToChatBody(body)
-	req, err := app.prepareStandardRequest(r.Context(), r, converted, "gpt-3.5-turbo", "responses", auth.Token)
+	req, err := app.prepareStandardRequest(r.Context(), r, converted, "qwen3.7-plus", "responses", auth.Token)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -5236,7 +5237,7 @@ func (app *App) handleAnthropicMessages(w http.ResponseWriter, r *http.Request) 
 			chatBody[key] = value
 		}
 	}
-	req, err := app.prepareStandardRequest(r.Context(), r, chatBody, "claude-3-haiku", "anthropic", auth.Token)
+	req, err := app.prepareStandardRequest(r.Context(), r, chatBody, "qwen3.7-plus", "anthropic", auth.Token)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -8126,7 +8127,11 @@ func (c *QwenClient) requestJSON(ctx context.Context, method, path, token string
 		req.Header.Set("Content-Type", "application/json")
 	}
 	start := time.Now()
-	logInfo(c.logger, ctx, "开始上游请求", "method", method, "path", path, "token", redactToken(token))
+	if isPrewarmLogContext(ctx) {
+		logDebug(c.logger, ctx, "开始上游请求", "method", method, "path", path, "token", redactToken(token))
+	} else {
+		logInfo(c.logger, ctx, "开始上游请求", "method", method, "path", path, "token", redactToken(token))
+	}
 	resp, err := c.http.Do(req)
 	if err != nil {
 		logWarn(c.logger, ctx, "上游请求失败", "method", method, "path", path, "token", redactToken(token), "duration_ms", time.Since(start).Milliseconds(), "error", err)
@@ -8138,6 +8143,8 @@ func (c *QwenClient) requestJSON(ctx context.Context, method, path, token string
 	if resp.StatusCode >= 400 {
 		attrs = append(attrs, "body", truncate(string(raw), 240))
 		logWarn(c.logger, ctx, "上游请求完成", attrs...)
+	} else if isPrewarmLogContext(ctx) {
+		logDebug(c.logger, ctx, "上游请求完成", attrs...)
 	} else {
 		logInfo(c.logger, ctx, "上游请求完成", attrs...)
 	}
@@ -8150,7 +8157,11 @@ func (c *QwenClient) CreateChat(ctx context.Context, token, model, chatType stri
 	}
 	ts := time.Now().Unix()
 	body := map[string]any{"title": fmt.Sprintf("api_%d", ts), "models": []string{model}, "chat_mode": "normal", "chat_type": normalizeUpstreamChatType(chatType), "timestamp": ts}
-	logInfo(c.logger, ctx, "开始创建上游会话", "model", model, "chat_type", chatType, "token", redactToken(token))
+	if isPrewarmLogContext(ctx) {
+		logDebug(c.logger, ctx, "开始创建上游会话", "model", model, "chat_type", chatType, "token", redactToken(token))
+	} else {
+		logInfo(c.logger, ctx, "开始创建上游会话", "model", model, "chat_type", chatType, "token", redactToken(token))
+	}
 	status, text, err := c.requestJSON(ctx, http.MethodPost, "/api/v2/chats/new", token, body, 30*time.Second)
 	if err != nil {
 		logWarn(c.logger, ctx, "创建上游会话请求失败", "model", model, "chat_type", chatType, "error", err)
@@ -8175,7 +8186,11 @@ func (c *QwenClient) CreateChat(ctx context.Context, token, model, chatType stri
 	if payload["success"] == false || id == "" {
 		return "", fmt.Errorf("Qwen API returned error or missing id: %s", truncate(text, 200))
 	}
-	logInfo(c.logger, ctx, "创建上游会话成功", "chat_id", id, "model", model, "chat_type", chatType)
+	if isPrewarmLogContext(ctx) {
+		logDebug(c.logger, ctx, "创建上游会话成功", "chat_id", id, "model", model, "chat_type", chatType)
+	} else {
+		logInfo(c.logger, ctx, "创建上游会话成功", "chat_id", id, "model", model, "chat_type", chatType)
+	}
 	return id, nil
 }
 
@@ -8546,6 +8561,7 @@ var logTestMarkers = []string{
 }
 
 type requestLogContextKey struct{}
+type prewarmLogContextKey struct{}
 
 type requestLogContext struct {
 	mu             sync.Mutex
@@ -8719,6 +8735,18 @@ func setRequestLogFields(ctx context.Context, fields ...any) {
 	}
 }
 
+func withPrewarmLogContext(ctx context.Context) context.Context {
+	return context.WithValue(ctx, prewarmLogContextKey{}, true)
+}
+
+func isPrewarmLogContext(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	value, _ := ctx.Value(prewarmLogContextKey{}).(bool)
+	return value
+}
+
 func requestLogFromContext(ctx context.Context) *requestLogContext {
 	if ctx == nil {
 		return nil
@@ -8794,6 +8822,12 @@ func (app *App) logError(ctx context.Context, msg string, attrs ...any) {
 func logInfo(logger *slog.Logger, ctx context.Context, msg string, attrs ...any) {
 	if logger != nil {
 		logger.Info(msg, appendLogAttrs(ctx, attrs...)...)
+	}
+}
+
+func logDebug(logger *slog.Logger, ctx context.Context, msg string, attrs ...any) {
+	if logger != nil {
+		logger.Debug(msg, appendLogAttrs(ctx, attrs...)...)
 	}
 }
 

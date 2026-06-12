@@ -102,6 +102,26 @@ func TestQwenHeadersIncludeRequestID(t *testing.T) {
 	}
 }
 
+func TestLoadSettingsKeepsChatIDPrewarmEnabledByDefault(t *testing.T) {
+	t.Setenv("CHAT_ID_PREWARM_TARGET_PER_ACCOUNT", "")
+
+	settings := LoadSettings()
+
+	if settings.ChatIDPrewarmTargetPerAccount != 5 {
+		t.Fatalf("ChatIDPrewarmTargetPerAccount = %d, want 5", settings.ChatIDPrewarmTargetPerAccount)
+	}
+}
+
+func TestResolveChatModelAliasesUseCurrentPlusDefault(t *testing.T) {
+	cases := []string{"qwen", "qwen-plus", "qwen-max", "gpt-4o", "gpt-5", "claude-sonnet-4-5", "gemini-2.5-pro"}
+	for _, input := range cases {
+		got := resolveModel(input)
+		if got != "qwen3.7-plus" {
+			t.Fatalf("resolveModel(%q) = %q, want qwen3.7-plus", input, got)
+		}
+	}
+}
+
 func TestUpstreamMediaFileClassMatchesQwenImageShape(t *testing.T) {
 	if got := upstreamUploadKind("image/png"); got != "image" {
 		t.Fatalf("upstreamUploadKind(image/png) = %q, want image", got)

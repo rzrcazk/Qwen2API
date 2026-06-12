@@ -27,9 +27,9 @@ export type ModelGroup = {
 }
 
 export const FALLBACK_CHAT_MODELS: ModelOption[] = [
-  { id: "qwen3.6-plus", base_model: "qwen3.6-plus", family: "qwen3.6", mode: "chat", display_name: "qwen3.6-plus", capabilities: {} },
-  { id: "qwen3.6-plus-thinking", base_model: "qwen3.6-plus", family: "qwen3.6", mode: "thinking", display_name: "qwen3.6-plus thinking", capabilities: { thinking: true } },
-  { id: "qwen3.6-plus-search", base_model: "qwen3.6-plus", family: "qwen3.6", mode: "search", display_name: "qwen3.6-plus search", capabilities: { search: true } },
+  { id: "qwen3.7-plus", base_model: "qwen3.7-plus", family: "qwen3.7", mode: "chat", display_name: "qwen3.7-plus", capabilities: {} },
+  { id: "qwen3.7-plus-thinking", base_model: "qwen3.7-plus", family: "qwen3.7", mode: "thinking", display_name: "qwen3.7-plus thinking", capabilities: { thinking: true } },
+  { id: "qwen3.7-plus-search", base_model: "qwen3.7-plus", family: "qwen3.7", mode: "search", display_name: "qwen3.7-plus search", capabilities: { search: true } },
 ]
 
 export const FALLBACK_IMAGE_MODELS: ModelOption[] = [
@@ -193,7 +193,7 @@ export function chooseDefaultModel(options: ModelOption[], currentModel?: string
   if (currentModel && options.some(option => option.id === currentModel)) return currentModel
   if (preferredId && options.some(option => option.id === preferredId)) return preferredId
   const base = options.find(isBaseModelOption)
-  return base?.id || options[0]?.id || preferredId || "qwen3.6-plus"
+  return base?.id || options[0]?.id || preferredId || "qwen3.7-plus"
 }
 
 export function groupModelOptions(options: ModelOption[]): ModelGroup[] {

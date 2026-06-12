@@ -179,7 +179,7 @@ export default function SettingsPage() {
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer YOUR_API_KEY" \
     -d '{
-      "model": "qwen3.6-plus",
+      "model": "qwen3.7-plus",
       "messages": [{"role": "user", "content": "Hello"}],
       "stream": true
     }'
@@ -196,7 +196,7 @@ export default function SettingsPage() {
     }'
 
   # Gemini
-  curl ${baseUrl}/v1beta/models/qwen3.6-plus:generateContent \
+  curl ${baseUrl}/v1beta/models/qwen3.7-plus:generateContent \
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer YOUR_API_KEY" \
     -d '{
@@ -208,7 +208,7 @@ export default function SettingsPage() {
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer YOUR_API_KEY" \
     -d '{
-      "model": "qwen3.6-plus-image",
+      "model": "qwen3.7-plus-image",
       "prompt": "A cyberpunk cat with neon lights, ultra realistic",
       "n": 1,
       "size": "1328x1328",
@@ -220,7 +220,7 @@ export default function SettingsPage() {
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer YOUR_API_KEY" \
     -d '{
-      "model": "qwen3.6-plus-video",
+      "model": "qwen3.7-plus-video",
       "prompt": "Generate a slow-motion ocean-wave video.",
       "duration": 5,
       "size": "1664x928",
